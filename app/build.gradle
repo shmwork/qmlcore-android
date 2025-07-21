@@ -4,11 +4,11 @@ android {
     ndkVersion "21.0.6113669"
     compileSdk 35
     defaultConfig {
-        applicationId "com.pureqml.qmlcore.runtime.android"
-        minSdkVersion 19
+        applicationId "ru.ufanet.iptv"
+        minSdkVersion 21
         targetSdkVersion 35
-        versionCode 1
-        versionName "1.0"
+        versionCode 17
+        versionName "1.2"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         multiDexEnabled true
     }

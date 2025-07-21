@@ -520,8 +520,8 @@ public final class MainActivity
             case KeyEvent.KEYCODE_MEDIA_REWIND: return "MediaRewind";
             case KeyEvent.KEYCODE_MEDIA_FAST_FORWARD: return "MediaFastForward";
             case KeyEvent.KEYCODE_MUTE: return "Mute";
-            case KeyEvent.KEYCODE_PAGE_UP: return "PageUp";
-            case KeyEvent.KEYCODE_PAGE_DOWN: return "PageDown";
+            case KeyEvent.KEYCODE_PAGE_UP: return "ChannelUp";
+            case KeyEvent.KEYCODE_PAGE_DOWN: return "ChannelDown";
             case KeyEvent.KEYCODE_PICTSYMBOLS: return "Pictsymbols";
             case KeyEvent.KEYCODE_SWITCH_CHARSET: return "SwitchCharset";
             case KeyEvent.KEYCODE_BUTTON_A: return "ButtonA";
