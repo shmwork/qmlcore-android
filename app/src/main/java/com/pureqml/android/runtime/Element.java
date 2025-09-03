@@ -28,6 +28,9 @@ import java.util.Comparator;
 public class Element extends BaseObject {
     public static final String TAG = "rt.Element";
 
+    public interface PaintDelegate {
+        void paint(PaintState state);
+    }
     public static final class AlreadyHasAParentException extends RuntimeException {
         AlreadyHasAParentException() { super("AlreadyHasAParentException"); }
     }
@@ -68,9 +71,9 @@ public class Element extends BaseObject {
     private boolean             _enableScrollY;
     private boolean             _useScrollX;
     private boolean             _useScrollY;
-    private Point               _scrollOffset;
+    private PointF              _scrollOffset;
     private Point               _motionStartPos;
-    private Point               _scrollPos;
+    private PointF              _scrollPos;
     private Element             _scrollingElement; //bloody html, scroll is reported on parent element
     private int                 _eventId;
 
@@ -80,9 +83,15 @@ public class Element extends BaseObject {
     private long                _scrollTimeBase;
     private long                _scrollTimeLast;
 
+    PaintDelegate               _paintDelegate;
+
     public Element(IExecutionEnvironment env) {
         super(env);
         addClass(_env.getDefaultStyle(getTag()));
+    }
+
+    public void setPaintDelegate(PaintDelegate paintDelegate) {
+        this._paintDelegate = paintDelegate;
     }
 
     String getTag() { return "div"; }
@@ -172,7 +181,8 @@ public class Element extends BaseObject {
             parent._cacheValid = false;
             if (parent._clip && !elementRect.isEmpty()) {
                 Rect parentRect = parent.getScreenRect(); //fixme: this makes this loop O(N^2)
-                elementRect.intersect(parentRect);
+                if (!elementRect.intersect(parentRect))
+                    elementRect.setEmpty();
             }
             parent = parent._parent;
         }
@@ -218,7 +228,7 @@ public class Element extends BaseObject {
         if (!findScrollingElement())
             return;
         if (_scrollingElement._scrollPos == null)
-            _scrollingElement._scrollPos = new Point();
+            _scrollingElement._scrollPos = new PointF();
         int dx = x - getScrollX();
         if (dx == 0)
             return;
@@ -231,7 +241,7 @@ public class Element extends BaseObject {
         if (!findScrollingElement())
             return;
         if (_scrollingElement._scrollPos == null)
-            _scrollingElement._scrollPos = new Point();
+            _scrollingElement._scrollPos = new PointF();
         int dy = y - getScrollY();
         if (dy == 0)
             return;
@@ -266,14 +276,14 @@ public class Element extends BaseObject {
     }
 
     final int getScrollXImpl() {
-        int x = _scrollOffset != null? _scrollOffset.x: 0;
-        x += _scrollPos != null? _scrollPos.x: 0;
+        int x = _scrollOffset != null? (int) _scrollOffset.x : 0;
+        x += _scrollPos != null? (int) _scrollPos.x : 0;
         return x;
     }
 
     final int getScrollYImpl() {
-        int y = _scrollOffset != null? _scrollOffset.y: 0;
-        y += _scrollPos != null? _scrollPos.y: 0;
+        int y = _scrollOffset != null? (int) _scrollOffset.y : 0;
+        y += _scrollPos != null? (int) _scrollPos.y : 0;
         return y;
     }
 
@@ -490,6 +500,8 @@ public class Element extends BaseObject {
     protected final void beginPaint(PaintState state) {
         _lastRect.setEmpty();
         _combinedRect.setEmpty();
+        if (_paintDelegate != null)
+            _paintDelegate.paint(state);
     }
 
     protected final void endPaint(PaintState state) {
@@ -677,9 +689,9 @@ public class Element extends BaseObject {
                     if (_motionStartPos == null)
                         _motionStartPos = new Point(); //FIXME: optimise me? (unwrap to 2 int members)
                     if (_scrollPos == null)
-                        _scrollPos = new Point();
+                        _scrollPos = new PointF();
                     if (_scrollOffset == null)
-                        _scrollOffset = new Point();
+                        _scrollOffset = new PointF();
                     _scrollVelocity = null;
                     _eventId = eventId;
                     _motionStartPos.x = (int) event.getX();
@@ -724,7 +736,7 @@ public class Element extends BaseObject {
                                         _useScrollX = true;
                                         handleMove = true;
                                     }
-                                } else if (enableScrollY) {
+                                } else /*if (enableScrollY)*/ {
                                     if (!horizontal) {
                                         _useScrollY = true;
                                         handleMove = true;

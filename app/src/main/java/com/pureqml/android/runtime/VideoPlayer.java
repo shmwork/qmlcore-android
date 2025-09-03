@@ -2,51 +2,74 @@ package com.pureqml.android.runtime;
 
 import android.content.Context;
 import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
 import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Looper;
+import android.text.TextPaint;
 import android.util.Log;
+import android.util.TypedValue;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 
 import androidx.annotation.Nullable;
+import androidx.annotation.OptIn;
+import androidx.annotation.NonNull;
+import androidx.media3.common.C;
+import androidx.media3.common.Format;
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.PlaybackException;
+import androidx.media3.common.PlaybackParameters;
+import androidx.media3.common.Player;
+import androidx.media3.common.Timeline;
+import androidx.media3.common.TrackSelectionOverride;
+import androidx.media3.common.Tracks;
+import androidx.media3.common.VideoSize;
+import androidx.media3.common.text.Cue;
+import androidx.media3.common.text.CueGroup;
+import androidx.media3.common.util.UnstableApi;
+import androidx.media3.datasource.DataSource;
+import androidx.media3.datasource.DefaultDataSource;
+import androidx.media3.exoplayer.DefaultLoadControl;
+import androidx.media3.exoplayer.DefaultRenderersFactory;
+import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.Renderer;
+import androidx.media3.exoplayer.hls.DefaultHlsExtractorFactory;
+import androidx.media3.exoplayer.hls.HlsMediaSource;
+import androidx.media3.exoplayer.source.BaseMediaSource;
+import androidx.media3.exoplayer.source.BehindLiveWindowException;
+import androidx.media3.exoplayer.source.LoadEventInfo;
+import androidx.media3.exoplayer.source.MediaLoadData;
+import androidx.media3.exoplayer.source.MediaSource;
+import androidx.media3.exoplayer.source.MediaSourceEventListener;
+import androidx.media3.exoplayer.source.ProgressiveMediaSource;
+import androidx.media3.exoplayer.text.SubtitleDecoderFactory;
+import androidx.media3.exoplayer.text.TextOutput;
+import androidx.media3.exoplayer.text.TextRenderer;
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector;
+import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory;
 
+import com.eclipsesource.v8.V8;
 import com.eclipsesource.v8.V8Array;
 import com.eclipsesource.v8.V8Function;
 import com.eclipsesource.v8.V8Object;
-import com.google.android.exoplayer2.DefaultLoadControl;
-import com.google.android.exoplayer2.ExoPlayer;
-import com.google.android.exoplayer2.MediaItem;
-import com.google.android.exoplayer2.PlaybackException;
-import com.google.android.exoplayer2.PlaybackParameters;
-import com.google.android.exoplayer2.Player;
-import com.google.android.exoplayer2.Timeline;
-import com.google.android.exoplayer2.extractor.ts.DefaultTsPayloadReaderFactory;
-import com.google.android.exoplayer2.source.BaseMediaSource;
-import com.google.android.exoplayer2.source.BehindLiveWindowException;
-import com.google.android.exoplayer2.source.LoadEventInfo;
-import com.google.android.exoplayer2.source.MediaLoadData;
-import com.google.android.exoplayer2.source.MediaSource;
-import com.google.android.exoplayer2.source.MediaSourceEventListener;
-import com.google.android.exoplayer2.source.ProgressiveMediaSource;
-import com.google.android.exoplayer2.source.hls.DefaultHlsExtractorFactory;
-import com.google.android.exoplayer2.source.hls.HlsMediaSource;
-import com.google.android.exoplayer2.trackselection.DefaultTrackSelector;
-import com.google.android.exoplayer2.upstream.DataSource;
-import com.google.android.exoplayer2.upstream.DefaultDataSource;
-import com.google.android.exoplayer2.video.VideoSize;
+import com.pureqml.android.ComputedStyle;
 import com.pureqml.android.IExecutionEnvironment;
 import com.pureqml.android.IResource;
 import com.pureqml.android.SafeRunnable;
 import com.pureqml.android.TypeConverter;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
 
-import static com.google.android.exoplayer2.C.TIME_UNSET;
+import static androidx.media3.common.C.TIME_UNSET;
 
 
 public final class VideoPlayer extends BaseObject implements IResource {
@@ -61,7 +84,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
         }
 
         @Override
-        public void surfaceCreated(SurfaceHolder holder) {
+        public void surfaceCreated(@NonNull SurfaceHolder holder) {
             handler.post(new SafeRunnable() {
                 @Override
                 protected void doRun() {
@@ -71,7 +94,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
         }
 
         @Override
-        public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+        public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {
             handler.post(new SafeRunnable() {
                 @Override
                 protected void doRun() {
@@ -81,7 +104,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
         }
 
         @Override
-        public void surfaceDestroyed(SurfaceHolder holder) {
+        public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
             handler.post(new SafeRunnable() {
                 @Override
                 protected void doRun() {
@@ -129,7 +152,6 @@ public final class VideoPlayer extends BaseObject implements IResource {
         @Deprecated
         @Override
         public void setType(int type) {
-            surfaceHolder.setType(type);
         }
 
         @Override
@@ -176,13 +198,39 @@ public final class VideoPlayer extends BaseObject implements IResource {
         public Surface getSurface() {
             return surfaceHolder.getSurface();
         }
-    };
+    }
 
+    @UnstableApi
+    private class CustomTextOutput implements TextOutput {
+        public CustomTextOutput() {
+        }
+
+        @Override
+        public void onCues(@NonNull CueGroup cueGroup) {
+            if (paintDelegate != null)
+                paintDelegate.setCue(cueGroup);
+        }
+    }
+
+    @UnstableApi
+    private static class CustomRenderersFactory extends DefaultRenderersFactory {
+        private final TextOutput customTextOutput;
+
+        public CustomRenderersFactory(Context context, TextOutput textOutput) {
+            super(context);
+            this.customTextOutput = textOutput;
+        }
+
+        @Override
+        protected void buildTextRenderers(@NonNull Context context, @NonNull TextOutput output, @NonNull Looper outputLooper, int extensionRendererMode, ArrayList<Renderer> out) {
+            out.add(new TextRenderer(customTextOutput, outputLooper));
+        }
+    }
 
     private static final String TAG = "VideoPlayer";
     private static final int PollingInterval = 500; //ms
 
-    private ExoPlayer                   player;
+    private ExoPlayer player;
     private final SurfaceView           surfaceView;
     private final ViewHolder<?>         viewHolder;
     private final Handler               handler;
@@ -198,12 +246,144 @@ public final class VideoPlayer extends BaseObject implements IResource {
     private boolean                     paused = false;
     private Runnable                    pollingTask = null;
 
+    private Tracks                      tracks = null;
+
     //exoplayer flags
     private int                         hlsExtractorFlags = 0;
     private boolean                     exposeCea608WhenMissingDeclarations = true;
+    private final static float                defaultTextSizeSP = 22;
 
-    public VideoPlayer(IExecutionEnvironment env) {
+    private static class PaintDelegate implements Element.PaintDelegate {
+        final Context context;
+        final Element ui;
+        CueGroup cueGroup;
+
+        PaintDelegate(Context context, Element ui) {
+            this.context = context;
+            this.ui = ui;
+        }
+
+        @Override
+        public void paint(PaintState state) {
+            if (cueGroup == null || cueGroup.cues.isEmpty())
+                return;
+            Rect rect = ui.getRect();
+            float textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP,
+                    defaultTextSizeSP, context.getResources().getDisplayMetrics());
+            float lineHeight = textSize * ComputedStyle.DefaultLineHeight;
+            TextPaint paint = new TextPaint(Paint.ANTI_ALIAS_FLAG | Paint.LINEAR_TEXT_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
+            paint.setTextSize(textSize);
+            for(Cue cue : cueGroup.cues) {
+                if (cue.text == null && cue.bitmap == null)
+                    continue;
+
+                String[] text = cue.text != null? cue.text.toString().split("\n"): new String[0];
+                float anchorPos;
+                if (cue.position != Cue.DIMEN_UNSET) {
+                    anchorPos = rect.left + cue.position * rect.width();
+                } else {
+                    switch(cue.positionAnchor) {
+                        case Cue.ANCHOR_TYPE_START:
+                            anchorPos = rect.left;
+                            break;
+                        case Cue.ANCHOR_TYPE_END:
+                            anchorPos = rect.right;
+                            break;
+                        case Cue.ANCHOR_TYPE_MIDDLE:
+                        case Cue.TYPE_UNSET:
+                        default:
+                            anchorPos = rect.left + rect.width() / 2.0f;
+                            break;
+                    }
+                }
+
+                float linePos;
+                switch(cue.lineAnchor) {
+                    case Cue.ANCHOR_TYPE_START:
+                        linePos = rect.top;
+                        break;
+                    case Cue.ANCHOR_TYPE_END:
+                        linePos = rect.bottom;
+                        break;
+                    case Cue.ANCHOR_TYPE_MIDDLE:
+                    case Cue.TYPE_UNSET:
+                    default:
+                        linePos = rect.top + rect.height() / 2.0f;
+                        break;
+                }
+
+                switch(cue.lineType) {
+                    case Cue.LINE_TYPE_FRACTION: {
+                        linePos += cue.line * rect.height();
+                        break;
+                    }
+                    case Cue.LINE_TYPE_NUMBER: {
+                        int lineCount = Math.round(rect.height() / lineHeight);
+                        int lineIdx = (int)cue.line;
+                        if (lineIdx < 0) {
+                            lineIdx += lineCount;
+                            // HLS subtitles often have line number -1 (last)
+                            // Correct it so the last line would be the last one on the screen.
+                            if (text.length > 1)
+                                lineIdx -= text.length - 1;
+                        }
+                        linePos = rect.top + (float)(lineIdx * rect.height()) / lineCount;
+                        break;
+                    }
+                    case Cue.TYPE_UNSET:
+                        break;
+                }
+
+                // vertical layouts are not supported
+                float x = anchorPos;
+                float y = linePos;
+
+                if (cue.text != null) {
+                    if (cue.textAlignment != null) {
+                        switch (cue.textAlignment) {
+                            case ALIGN_NORMAL:
+                                paint.setTextAlign(Paint.Align.LEFT);
+                                break;
+                            case ALIGN_OPPOSITE:
+                                paint.setTextAlign(Paint.Align.RIGHT);
+                                break;
+                            case ALIGN_CENTER:
+                            default:
+                                paint.setTextAlign(Paint.Align.CENTER);
+                                break;
+                        }
+                    }
+                    for(String line : text) {
+                        paint.setStyle(Paint.Style.STROKE);
+                        paint.setColor(Color.BLACK);
+                        state.drawText(line, x, y, paint);
+                        paint.setStyle(Paint.Style.FILL);
+                        paint.setColor(Color.WHITE);
+                        state.drawText(line, x, y, paint);
+                        y += lineHeight;
+                    }
+                } else {
+                    Rect dstRect = new Rect((int)x, (int)y, (int)(x + cue.bitmap.getWidth()), (int)(y + cue.bitmap.getHeight()));
+                    state.drawBitmap(cue.bitmap, null, dstRect, paint);
+                }
+            }
+        }
+
+        void setCue(@NonNull CueGroup cueGroup) {
+            Log.v(TAG, "onCues " + cueGroup.cues.size());
+            this.cueGroup = cueGroup;
+            ui.update();
+        }
+    }
+    PaintDelegate                       paintDelegate;
+
+    public VideoPlayer(IExecutionEnvironment env, Element ui) {
         super(env);
+
+        if (ui != null) {
+            paintDelegate = new PaintDelegate(env.getContext(), ui);
+            ui.setPaintDelegate(paintDelegate);
+        }
 
         HandlerThread thread = new HandlerThread(this.toString());
         thread.start();
@@ -211,7 +391,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
 
         Context context = env.getContext();
         surfaceView = new SurfaceView(context);
-        viewHolder = new ViewHolder<>(context, surfaceView);
+        viewHolder = new ViewHolder<>(surfaceView);
 
         period = new Timeline.Period();
 
@@ -221,7 +401,12 @@ public final class VideoPlayer extends BaseObject implements IResource {
     }
 
     public void emit(String name, Object ... args) {
-        _env.getExecutor().execute(new SafeRunnable() {
+        ExecutorService executor = _env.getExecutor();
+        if (executor == null) {
+            Log.w(TAG, "no executor, skipping event " + name);
+            return;
+        }
+        executor.execute(new SafeRunnable() {
             @Override
             public void doRun() {
                 VideoPlayer.this.emit(null, name, args);
@@ -253,6 +438,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
         });
     }
 
+    @OptIn(markerClass = UnstableApi.class)
     private static boolean isBehindLiveWindow(PlaybackException e) {
         Throwable cause = e.getCause();
         while (cause != null) {
@@ -264,6 +450,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
         return false;
     }
 
+    @OptIn(markerClass = UnstableApi.class)
     private void acquireResourceImpl() {
         if (player != null)
             return;
@@ -281,10 +468,12 @@ public final class VideoPlayer extends BaseObject implements IResource {
                         .setAllowVideoMixedMimeTypeAdaptiveness(true)
                         .setAllowAudioMixedMimeTypeAdaptiveness(true)
                         .setAllowVideoNonSeamlessAdaptiveness(true)
+                        .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, /* disabled= */ true)
         );
 
         player = new ExoPlayer.Builder(context)
                 .setTrackSelector(trackSelector)
+                .setRenderersFactory(new CustomRenderersFactory(context, new CustomTextOutput()))
                 .setLoadControl(loadControl)
                 .setLooper(handler.getLooper())
                 .build();
@@ -307,7 +496,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
             }
 
             @Override
-            public void onPlayerError(PlaybackException error) {
+            public void onPlayerError(@NonNull PlaybackException error) {
                 Log.d(TAG, "onPlayerError " + error);
                 VideoPlayer.this.emit("error", error.toString());
                 if (isBehindLiveWindow(error)) {
@@ -318,7 +507,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
             }
 
             @Override
-            public void onPositionDiscontinuity(Player.PositionInfo oldPosition, Player.PositionInfo newPosition, int reason) {
+            public void onPositionDiscontinuity(@NonNull Player.PositionInfo oldPosition, @NonNull Player.PositionInfo newPosition, int reason) {
                 Log.d(TAG, "onPositionDiscontinuity " + reason);
                 if (reason == Player.DISCONTINUITY_REASON_SEEK) {
                     Log.d(TAG, "onSeekProcessed");
@@ -327,7 +516,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
             }
 
             @Override
-            public void onPlaybackParametersChanged(PlaybackParameters playbackParameters) {
+            public void onPlaybackParametersChanged(@NonNull PlaybackParameters playbackParameters) {
                 Log.d(TAG, "onPlaybackParametersChanged " + playbackParameters);
             }
 
@@ -337,8 +526,8 @@ public final class VideoPlayer extends BaseObject implements IResource {
             }
 
             @Override
-            public void onVideoSizeChanged(VideoSize videoSize) {
-                Log.v(TAG, "onVideoSizeChanged " + videoSize.width + "x" + videoSize.height + ", rotation: " + videoSize.unappliedRotationDegrees + ", par: " + videoSize.pixelWidthHeightRatio);
+            public void onVideoSizeChanged(@NonNull VideoSize videoSize) {
+                Log.v(TAG, "onVideoSizeChanged " + videoSize.width + "x" + videoSize.height + ", par: " + videoSize.pixelWidthHeightRatio);
                 videoWidth = (int)(videoSize.width * videoSize.pixelWidthHeightRatio);
                 videoHeight = videoSize.height;
                 handler.post(new SafeRunnable() {
@@ -356,6 +545,24 @@ public final class VideoPlayer extends BaseObject implements IResource {
             @Override
             public void onRenderedFirstFrame() {
                 Log.v(TAG, "onRenderedFirstFrame");
+            }
+
+            @Override
+            public void onTracksChanged(@NonNull Tracks tracks) {
+                Log.v(TAG, "onTracksChanged");
+                int groupIdx = 0;
+                for (Tracks.Group trackGroup : tracks.getGroups()) {
+                    Log.d(TAG, "TrackGroup type: " + trackGroup.getType() + ", id: " + trackGroup.getMediaTrackGroup().id);
+                    for (int i = 0; i < trackGroup.length; i++) {
+                        // Individual track information.
+                        boolean isSupported = trackGroup.isTrackSupported(i);
+                        boolean isSelected = trackGroup.isTrackSelected(i);
+                        Format trackFormat = trackGroup.getTrackFormat(i);
+                        Log.d(TAG, "track[" + groupIdx + "." + i + "]: supported: " + isSupported +", selected: " + isSelected + ", format: " + trackFormat);
+                    }
+                    ++groupIdx;
+                }
+                VideoPlayer.this.tracks = tracks;
             }
         });
 
@@ -404,6 +611,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
         });
     }
 
+    @OptIn(markerClass = {UnstableApi.class, UnstableApi.class})
     public void setSource(String url) {
         Log.i(TAG, "Player.setSource " + url);
         source = url;
@@ -417,6 +625,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
 
         DataSource.Factory dataSourceFactory = new DefaultDataSource.Factory(_env.getContext());
 
+        SubtitleDecoderFactory subtitleDecoderFactory = SubtitleDecoderFactory.DEFAULT;
         BaseMediaSource source;
         if (url.contains(".m3u8")) { //FIXME: add proper content type here
             HlsMediaSource.Factory factory = new HlsMediaSource.Factory(dataSourceFactory);
@@ -430,7 +639,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
 
         source.addEventListener(handler, new MediaSourceEventListener() {
             @Override
-            public void onLoadError(int windowIndex, @Nullable MediaSource.MediaPeriodId mediaPeriodId, LoadEventInfo loadEventInfo, MediaLoadData mediaLoadData, IOException error, boolean wasCanceled) {
+            public void onLoadError(int windowIndex, @Nullable MediaSource.MediaPeriodId mediaPeriodId, @NonNull LoadEventInfo loadEventInfo, @NonNull MediaLoadData mediaLoadData, @NonNull IOException error, boolean wasCanceled) {
                 Log.w(TAG, "onLoadError");
                 VideoPlayer.this.emit("error", "Source load error: " + error.getLocalizedMessage());
             }
@@ -462,7 +671,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
                 if (paused)
                 {
                     paused = false;
-                    VideoPlayer.this.emit("pause", paused);
+                    VideoPlayer.this.emit("pause", false);
                     if (player != null)
                         player.setPlayWhenReady(true);
                 }
@@ -480,7 +689,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
                 if (!paused)
                 {
                     paused = true;
-                    VideoPlayer.this.emit("pause", paused);
+                    VideoPlayer.this.emit("pause", true);
                     if (player != null)
                         player.setPlayWhenReady(false);
                 }
@@ -522,6 +731,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
     public void setOption(String name, Object value) {
         Log.i(TAG, "Player.setOption " + name + " : " + value);
         handler.post(new SafeRunnable() {
+            @OptIn(markerClass = UnstableApi.class)
             @Override
             public void doRun() {
                 switch (name) {
@@ -585,6 +795,86 @@ public final class VideoPlayer extends BaseObject implements IResource {
 
     public void setRect(int l, int t, int r, int b) {
         setRect(new Rect(l, t, r, b));
+    }
+
+    public Object getSubtitles() {
+        Log.v(TAG, "getSubtitles()");
+        V8 v8 = _env.getRuntime();
+        V8Array subs = new V8Array(v8);
+        if (tracks == null) {
+            Log.w(TAG, "no tracks registered, wait for onTracksChanged event");
+            return subs;
+        }
+
+        int groupIdx = 0;
+        for (Tracks.Group trackGroup : tracks.getGroups()) {
+            if (trackGroup.getType() != C.TRACK_TYPE_TEXT) {
+                ++groupIdx;
+                continue;
+            }
+            for (int i = 0; i < trackGroup.length; i++) {
+                // Individual track information.
+                boolean isSupported = trackGroup.isTrackSupported(i);
+                boolean isSelected = trackGroup.isTrackSelected(i);
+                Format trackFormat = trackGroup.getTrackFormat(i);
+                if (!isSupported) {
+                    continue;
+                }
+                Log.d(TAG, "track[" + groupIdx + "." + i + "]: selected: " + isSelected + ", format: " + trackFormat);
+                V8Object track = new V8Object(v8);
+                track.add("id", groupIdx + "." + i);
+                track.add("active", isSelected);
+                track.add("language", trackFormat.language);
+                track.add("label", trackFormat.label);
+                subs.push(track);
+            }
+            ++groupIdx;
+        }
+        return subs;
+    }
+
+    private void hideSubtitles() {
+        Log.i(TAG, "hideSubtitles");
+        handler.post(new SafeRunnable() {
+            @Override
+            public void doRun() {
+                player.setTrackSelectionParameters(
+                        player.getTrackSelectionParameters()
+                                .buildUpon()
+                                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, /* disabled= */ true)
+                                .build());
+            }
+        });
+    }
+
+    public void setSubtitles(String trackId) {
+        Log.d(TAG, "setSubtitles " + trackId);
+        if (trackId == null) {
+            hideSubtitles();
+            return;
+        }
+        String[] groupAndId = trackId.split("\\.");
+        if (groupAndId.length != 2)
+            throw new RuntimeException("invalid trackId format");
+
+        int groupId = Integer.parseInt(groupAndId[0]);
+        int trackIdx = Integer.parseInt(groupAndId[1]);
+        Tracks.Group trackGroup = tracks.getGroups().get(groupId);
+        Format trackFormat = trackGroup.getTrackFormat(trackIdx);
+        Log.i(TAG, "setSubtitles, group " + groupId + ", track id: " + trackIdx + ", language: " + trackFormat.language + ", label: " + trackFormat.label);
+        handler.post(new SafeRunnable() {
+            @Override
+            public void doRun() {
+                player.setTrackSelectionParameters(
+                        player.getTrackSelectionParameters()
+                                .buildUpon()
+                                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, /* disabled= */ false)
+                                .setOverrideForType(new TrackSelectionOverride(
+                                        trackGroup.getMediaTrackGroup(), trackIdx
+                                ))
+                                .build());
+            }
+        });
     }
 
     public void setHlsExtractorFlag(int flag, boolean flagSwitcher) {
