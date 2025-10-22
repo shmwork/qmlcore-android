@@ -232,6 +232,7 @@ public final class ExecutionEnvironment extends Service
                 final int DeviceMobile   = 2;
 
                 V8Object info = new V8Object(_v8);
+                info.add("bleAdvertiserName", Settings.Secure.getString(getContext().getContentResolver(), "ble_advertiser_name"));
                 info.add("deviceId", Settings.Secure.getString(getContext().getContentResolver(), Settings.Secure.ANDROID_ID));
                 info.add("language", Locale.getDefault().toString());
                 info.add("modelName", Build.MODEL);
