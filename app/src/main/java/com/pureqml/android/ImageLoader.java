@@ -14,6 +14,7 @@ import com.caverock.androidsvg.SVGParseException;
 
 import java.io.BufferedInputStream;
 import java.io.InputStream;
+import java.lang.ref.WeakReference;
 import java.net.URL;
 import java.util.LinkedList;
 import java.util.List;
@@ -50,6 +51,7 @@ public final class ImageLoader {
                     holder = new ImageStaticHolder(url);
                 }
                 _cache.put(url, holder);
+                Log.v(TAG, "cache size: " + _cache.size());
                 _threadPool.execute(new ImageLoaderTask(url, holder));
             }
             return holder;
@@ -93,16 +95,18 @@ public final class ImageLoader {
             } catch(Exception ex) {
                 Log.e(TAG, "image loading failed", ex);
             } finally {
-                _holder.finish();
-                _cache.put(_url, _holder);
+                synchronized (_cache) {
+                    _cache.remove(_url);
+                    _holder.finish();
+                    _cache.put(_url, _holder);
+                }
+                Log.v(TAG, "cache size: " + _cache.size());
             }
             Log.i(TAG, "finished loading task on " + _url);
         }
     }
 
     private interface ImageHolder {
-        URL getUrl();
-
         void load(InputStream stream);
         Bitmap getBitmap(int w, int h);
 
@@ -116,7 +120,8 @@ public final class ImageLoader {
     {
         protected final URL                 _url;
         private boolean                     _finished;
-        private List<ImageLoadedCallback>   _callbacks;
+        protected Bitmap                    _image;
+        private List<WeakReference<ImageLoadedCallback>> _callbacks;
 
         BaseImageHolder(URL url) {
             _url = url;
@@ -124,15 +129,12 @@ public final class ImageLoader {
         }
 
         @Override
-        public URL getUrl() { return _url; }
-
-        @Override
         public void notify(ImageLoadedCallback callback) {
             boolean finished;
             synchronized (this) {
                 finished = _finished;
                 if (!finished) {
-                    _callbacks.add(callback);
+                    _callbacks.add(new WeakReference<>(callback));
                 }
             }
             if (finished)
@@ -160,20 +162,25 @@ public final class ImageLoader {
                 _finished = true;
             }
 
-            for(ImageLoadedCallback callback : _callbacks) {
+            for(WeakReference<ImageLoadedCallback> ref : _callbacks) {
                 try {
-                    callback.onImageLoaded(_url, getNotifyBitmap());
+                    ImageLoadedCallback callback = ref.get();
+                    if (callback != null)
+                        callback.onImageLoaded(_url, getNotifyBitmap());
                 } catch(Exception ex) {
                     Log.e(TAG, "onImageLoaded failed: ", ex);
                 }
             }
             _callbacks = null;
         }
+
+        @Override
+        public synchronized int byteCount() {
+            return _url.toString().length() * 4 + (_finished && _image != null? _image.getByteCount(): 0);
+        }
     }
 
     private static class ImageStaticHolder extends BaseImageHolder {
-        Bitmap  _image = null;
-
         ImageStaticHolder(URL url) {
             super(url);
         }
@@ -188,15 +195,9 @@ public final class ImageLoader {
         public Bitmap getBitmap(int w, int h) {
             return _image;
         }
-
-        @Override
-        public synchronized int byteCount() {
-            return _url.toString().length() + (_image != null? _image.getByteCount(): 0);
-        }
     }
 
     private static class ImageVectorHolder extends BaseImageHolder {
-        Bitmap  _image;
         SVG     _svg;
 
         ImageVectorHolder(URL url) {
@@ -233,11 +234,6 @@ public final class ImageLoader {
                 _image = bitmap;
                 return _image;
             }
-        }
-
-        @Override
-        public synchronized int byteCount() {
-            return _url.toString().length() + (_image != null? _image.getByteCount(): 0);
         }
     }
 }
