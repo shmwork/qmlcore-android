@@ -358,9 +358,19 @@ public final class MainActivity
     protected void onStop() {
         super.onStop();
         Log.i(TAG, "stopping main activity...");
-        if (_executionEnvironment != null)
+        if (_executionEnvironment != null) {
             _executionEnvironment.releaseResource();
+			_executionEnvironment.pause();
+		}
     }
+
+	@Override
+	protected void onUserLeaveHint() {
+		super.onUserLeaveHint();
+		Log.i(TAG, "onUserLeaveHint");
+		if (_executionEnvironment != null)
+			_executionEnvironment.pause(); 
+	}
 
     @Override
     protected void onPause() {
