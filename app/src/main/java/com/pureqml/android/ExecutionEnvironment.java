@@ -28,6 +28,10 @@ import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.View;
 import android.view.ViewGroup;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
 
 import com.eclipsesource.v8.JavaCallback;
 import com.eclipsesource.v8.JavaVoidCallback;
@@ -143,6 +147,9 @@ public final class ExecutionEnvironment extends Service
     private boolean                     _keepScreenOn;
     private boolean                     _fullScreen;
     private int                         _debugColorIndex;
+    private ConnectivityManager.NetworkCallback _networkCallback;
+    private ConnectivityManager         _connectivityManager;
+    private Boolean                     _networkStatus;
 
     public ExecutionEnvironment() {
         super();
@@ -526,6 +533,92 @@ public final class ExecutionEnvironment extends Service
         });
     }
 
+    private void updateNetworkStatus(boolean available) {
+        if (_networkStatus != null && _networkStatus == available) {
+            Log.v(TAG, "network status unchanged: " + available);
+            return;
+        }
+        _networkStatus = available;
+        _executor.execute(new SafeRunnable() {
+            @Override
+            public void doRun() {
+                Log.i(TAG, "updateNetworkStatus: " + available);
+                if (_rootElement != null) {
+                    _rootElement.emit(_rootObject, "networkStatus", available);
+                }
+            }
+        });
+    }
+
+    private boolean isNetworkValidated(NetworkCapabilities caps) {
+        return caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+    }
+
+    private boolean isNetworkValidated(Network network) {
+        if (network == null || _connectivityManager == null) {
+            return false;
+        }
+        NetworkCapabilities caps = _connectivityManager.getNetworkCapabilities(network);
+        return isNetworkValidated(caps);
+    }
+
+    private void startNetworkListener() {
+        if (_networkCallback != null) {
+            return;
+        }
+        
+        if (_rootElement == null) {
+            Log.w(TAG, "startNetworkListener: _rootElement is null, will retry later");
+            return;
+        }
+
+        _connectivityManager = (ConnectivityManager) getContext().getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (_connectivityManager == null) {
+            Log.w(TAG, "ConnectivityManager is not available");
+            return;
+        }
+
+        NetworkRequest request = new NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build();
+
+        _networkCallback = new ConnectivityManager.NetworkCallback() {
+            @Override
+            public void onAvailable(Network network) {
+                updateNetworkStatus(isNetworkValidated(network));
+            }
+
+            @Override
+            public void onLost(Network network) {
+                updateNetworkStatus(false);
+            }
+
+            @Override
+            public void onCapabilitiesChanged(Network network, NetworkCapabilities caps) {
+                updateNetworkStatus(isNetworkValidated(caps));
+            }
+        };
+
+        try {
+            _connectivityManager.registerNetworkCallback(request, _networkCallback);
+
+            Network active = _connectivityManager.getActiveNetwork();
+            updateNetworkStatus(isNetworkValidated(active));
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to register network callback", e);
+        }
+    }
+
+    private void stopNetworkListener() {
+        if (_networkCallback == null || _connectivityManager == null) return;
+        try {
+            _connectivityManager.unregisterNetworkCallback(_networkCallback);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to unregister network callback", e);
+        }
+        _networkCallback = null;
+    }
+
     private void loadFont(String path) {
         Log.i(TAG, "loadFont " + path);
 
@@ -608,6 +701,8 @@ public final class ExecutionEnvironment extends Service
 
         if (_surfaceGeometry != null) { //already signalled
             setup();
+        } else {
+            startNetworkListener();
         }
         Log.v(TAG, "finishing start, painting...");
         paint();
@@ -638,10 +733,14 @@ public final class ExecutionEnvironment extends Service
             _exports.close();
             _exports = null;
         }
+        
+        startNetworkListener();
     }
 
     @Override
     public void onDestroy() {
+        stopNetworkListener();
+        
         Future<Void> future = _executor.submit(() -> {
         _timers.discard();
 
