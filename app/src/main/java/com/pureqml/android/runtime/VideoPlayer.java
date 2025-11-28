@@ -251,7 +251,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
     //exoplayer flags
     private int                         hlsExtractorFlags = 0;
     private boolean                     exposeCea608WhenMissingDeclarations = true;
-    private final static float                defaultTextSizeSP = 22;
+    private final static float          defaultTextSizeSP = 22;
 
     private static class PaintDelegate implements Element.PaintDelegate {
         final Context context;
@@ -523,6 +523,8 @@ public final class VideoPlayer extends BaseObject implements IResource {
             @Override
             public void onIsPlayingChanged(boolean isPlaying) {
                 Log.v(TAG, "onIsPlayingChanged " + isPlaying);
+                VideoPlayer.this.emit("pause", !isPlaying);
+                paused = !isPlaying;
             }
 
             @Override
@@ -605,6 +607,8 @@ public final class VideoPlayer extends BaseObject implements IResource {
         handler.post(new SafeRunnable() {
             @Override
             public void doRun() {
+                paused = true;
+                VideoPlayer.this.emit("pause", true);
                 if (player != null)
                     player.stop();
             }
@@ -947,5 +951,4 @@ public final class VideoPlayer extends BaseObject implements IResource {
         viewHolder.discard(_env.getRootView());
         releaseResource();
     }
-
 }
