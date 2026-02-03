@@ -48,7 +48,8 @@ public final class Text extends Element {
     String              _fontFamily = null;
     int                 _fontWeight = 0;
     boolean             _fontItalic = false;
-    final float               _lineHeight = ComputedStyle.DefaultLineHeight;
+    String              _fontSize = null;
+    final float         _lineHeight = ComputedStyle.DefaultLineHeight;
 
     public Text(IExecutionEnvironment env) {
         super(env);
@@ -65,6 +66,17 @@ public final class Text extends Element {
         updateTypeface();
     }
 
+    // note - this won't reset your size back
+    private void updateFontSize() {
+        if (_fontSize != null) {
+            try {
+                _paint.setTextSize(TypeConverter.toFontSize(_fontSize, _env.getDisplayMetrics()));
+            } catch(RuntimeException ex) {
+                Log.w(TAG, "TypeConverter.toFontSize failed", ex);
+            }
+        }
+    }
+
     private void updateTypeface() {
         if (_paint == null)
             _paint = new TextPaint(Paint.ANTI_ALIAS_FLAG | Paint.LINEAR_TEXT_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
@@ -72,6 +84,8 @@ public final class Text extends Element {
         int fontWeight = _fontWeight > 0? _fontWeight: _style != null? _style.fontWeight: ComputedStyle.NormalWeight;
         Typeface tf = _env.getTypeface(fontFamily, fontWeight, _fontItalic);
         _paint.setTypeface(tf);
+        updateFontSize();
+        resetLayout();
         update();
     }
 
@@ -96,15 +110,8 @@ public final class Text extends Element {
                 updateTypeface();
                 break;
             case "font-size":
-                try {
-                    IRenderer renderer = _env.getRenderer();
-                    if (renderer != null)
-                        _paint.setTextSize(TypeConverter.toFontSize((String)value, renderer.getDisplayMetrics()));
-                    else
-                        Log.w(TAG, "no renderer, font-size ignored");
-                } catch (Exception e) {
-                    Log.w(TAG, "set font-size failed", e);
-                }
+                _fontSize = (String)value;
+                updateFontSize();
                 break;
             case "font-weight":
                 _fontWeight = ComputedStyle.parseFontWeight(value);
@@ -319,6 +326,7 @@ public final class Text extends Element {
         }
     }
 
+    // no update here because it's only called from setStyle, add it if you use it somewhere else
     private void setWrap(Wrap wrap) {
         _wrap = wrap;
         resetLayout();
