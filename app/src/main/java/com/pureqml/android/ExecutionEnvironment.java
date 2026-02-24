@@ -34,6 +34,7 @@ import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 
+import android.view.Surface;
 import com.eclipsesource.v8.JavaCallback;
 import com.eclipsesource.v8.JavaVoidCallback;
 import com.eclipsesource.v8.Releasable;
@@ -152,6 +153,7 @@ public final class ExecutionEnvironment extends Service
     private ConnectivityManager.NetworkCallback _networkCallback;
     private ConnectivityManager         _connectivityManager;
     private Boolean                     _networkStatus;
+    private volatile boolean            _active = true;
 
     public ExecutionEnvironment() {
         super();
@@ -532,6 +534,7 @@ public final class ExecutionEnvironment extends Service
     }
 
     private void updateActiveState(boolean active) {
+        _active = active;
         _executor.execute(new SafeRunnable() {
             @Override
             public void doRun() {
@@ -882,6 +885,9 @@ public final class ExecutionEnvironment extends Service
         if (el == null)
             return;
 
+        if (!_active)
+            return;
+
         synchronized (_updatedElements) {
             _updatedElements.add(el);
         }
@@ -913,12 +919,26 @@ public final class ExecutionEnvironment extends Service
 
 
     public void paint(final SurfaceHolder holder) {
-        if (_rootElement == null || holder == null || holder.getSurface() == null)
+        if (_rootElement == null) {
+            Log.w(TAG, "paint skip: rootElement=null");
             return;
+        }
+        if (holder == null) {
+            Log.w(TAG, "paint skip: holder is null");
+            return;
+        }
+
+        Surface surface = holder.getSurface();
+        if (surface == null || !surface.isValid()) {
+            Log.w(TAG, "paint skip: surface invalid surface=" + surface);
+            return;
+        }
 
         Rect rect = popDirtyRect();
-        if (rect == null)
+        if (rect == null) {
+            Log.v(TAG, "paint skip: no dirty rect");
             return;
+        }
 
         Canvas canvas = null;
         try {
@@ -933,24 +953,25 @@ public final class ExecutionEnvironment extends Service
                 }
 
                 _rootElement.paint(paint);
-
-//                {
-//                    Paint updatePaint = new Paint();
-//                    updatePaint.setColor(getDebugColorIndex());
-//                    canvas.drawRect(rect, updatePaint);
-//                }
+            } else {
+                Log.w(TAG, "paint lockCanvas returned null for rect=" + rect);
             }
         } catch (Exception e) {
-            Log.e(TAG, "repaint failed", e);
+            Log.e(TAG, "paint repaint failed", e);
         } finally {
-            if (canvas != null)
-                holder.unlockCanvasAndPost(canvas);
+            if (canvas != null) {
+                try {
+                    holder.unlockCanvasAndPost(canvas);
+                } catch (Exception e) {
+                    Log.e(TAG, "paint unlockCanvasAndPost failed", e);
+                }
+            }
         }
     }
 
     public void paint() {
         synchronized (this) {
-            if (_paintScheduled || _executor == null || _executor.isShutdown() || _rootElement == null || _renderer == null)
+            if (_paintScheduled || _executor == null || _executor.isShutdown() || _rootElement == null || _renderer == null || !_active)
                 return;
             _paintScheduled = true;
         }

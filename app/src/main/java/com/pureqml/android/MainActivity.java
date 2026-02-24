@@ -181,8 +181,15 @@ public final class MainActivity
                         finish();
                     }
                 };
-                if (_executionEnvironment != null)
+                if (_executionEnvironment != null) {
+                    _executionEnvironment.setSurfaceHolder(holder);
+                    Rect frame = holder.getSurfaceFrame();
+                    if (frame != null) {
+                        _surfaceFrame = frame;
+                        _executionEnvironment.setSurfaceFrame(frame);
+                    }
                     _executionEnvironment.setRenderer(_uiRenderer);
+                }
             }
         }
 
@@ -207,8 +214,10 @@ public final class MainActivity
         public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
             Log.i(TAG, "surface destroyed");
             synchronized (MainActivity.this) {
-                if (_executionEnvironment != null)
+                if (_executionEnvironment != null) {
                     _executionEnvironment.setRenderer(null);
+                    _executionEnvironment.setSurfaceHolder(null);
+                }
                 _surfaceFrame = null;
             }
         }
@@ -404,6 +413,7 @@ public final class MainActivity
 
     @Override
     protected void onDestroy() {
+        Log.i(TAG, "onDestroy");
         if (_executionEnvironmentBound)
             unbindService(_executionEnvironmentConnection);
         _mainView = null;
