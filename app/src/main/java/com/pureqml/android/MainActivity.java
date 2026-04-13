@@ -37,6 +37,7 @@ import com.pureqml.android.runtime.Element;
 
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
+import com.pureqml.android.TvHomePublisher;
 
 public final class MainActivity
         extends AppCompatActivity
@@ -233,6 +234,7 @@ public final class MainActivity
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+		TvHomePublisher.publishTestChannel(this);
 
         {
             ActionBar bar = getSupportActionBar();
