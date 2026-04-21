@@ -288,6 +288,12 @@ public final class MainActivity
         _executionEnvironmentBound = true;
     }
 
+	@Override
+	protected void onNewIntent(Intent intent) {
+		super.onNewIntent(intent);
+		setIntent(intent);
+	}
+
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
         Log.i(TAG, "onConfigurationChanged: keyboard: " + newConfig.keyboard + ", hidden: " + newConfig.keyboardHidden + ", hard keyboard hidden: " + newConfig.hardKeyboardHidden);

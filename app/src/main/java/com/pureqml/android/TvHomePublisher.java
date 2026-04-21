@@ -38,6 +38,7 @@ public final class TvHomePublisher {
                 "Менталистка",
                 "Фэнтези, Мелодрама",
                 "content/10850",
+				"1",
                 "movie-101",
                 "https://media-test.iptv.ufanet.ru/media/program_images/9867654.jpg?h=569&w=1013"
         );
@@ -48,6 +49,7 @@ public final class TvHomePublisher {
                 "маша и медведь",
                 "медведь и маша",
                 "content/493510",
+				"0",
                 "movie-102",
                 "https://media-test.iptv.ufanet.ru/media/program_images/9933368.jpg?h=569&w=1013"
         );
@@ -58,6 +60,7 @@ public final class TvHomePublisher {
                 "я канал",
                 "5 петербург",
                 "channelLiveByLCN/5",
+				"1",
                 "channel-202",
                 "https://media-test.iptv.ufanet.ru/media/cd25d755-e9c2-4772-958a-8835265ea027.png?h=44&w=79"
         );
@@ -73,12 +76,14 @@ public final class TvHomePublisher {
             String title,
             String description,
             String contentCardUrl,
+			String is_adult,
             String internalId,
             String posterUrl
     ) {
         Intent launchIntent = new Intent(Intent.ACTION_VIEW)
                 .setData(Uri.parse("ufanet://ru.ufanet.iptv"))
-                .putExtra("url", contentCardUrl);
+                .putExtra("url", contentCardUrl)
+                .putExtra("is_adult", is_adult);
 
         Uri intentUri = Uri.parse(launchIntent.toUri(Intent.URI_INTENT_SCHEME));
 
