@@ -38,7 +38,6 @@ import com.pureqml.android.runtime.Element;
 
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
-import com.pureqml.android.TvHomePublisher;
 
 public final class MainActivity
         extends AppCompatActivity
@@ -121,7 +120,16 @@ public final class MainActivity
                     @Override
                     public String getIntentParam(String paramName) {
                         Log.i(TAG, "get getIntentParam " + paramName);
-                        return getIntent().getStringExtra(paramName);
+                        Intent intent = getIntent();
+                        if (intent == null)
+                            return null;
+                        String value = intent.getStringExtra(paramName);
+                        // Параметр диплинка отдаем только один раз: иначе один и тот же
+                        // интент будет перечитываться на каждом onResume и диплинк
+                        // будет срабатывать повторно после сворачивания приложения.
+                        if (value != null)
+                            intent.removeExtra(paramName);
+                        return value;
                     }
 
                     @Override
@@ -245,7 +253,6 @@ public final class MainActivity
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-		TvHomePublisher.publishTestChannel(this);
 
         {
             ActionBar bar = getSupportActionBar();
@@ -298,6 +305,20 @@ public final class MainActivity
                 ExecutionEnvironment.class), _executionEnvironmentConnection, Context.BIND_AUTO_CREATE | Context.BIND_ADJUST_WITH_ACTIVITY);
         _executionEnvironmentBound = true;
     }
+
+	@Override
+	protected void onNewIntent(Intent intent) {
+		super.onNewIntent(intent);
+		Log.i(TAG, "onNewIntent: " + intent);
+		setIntent(intent);
+		// Диплинк при уже запущенном приложении: сообщаем рантайму, чтобы QML перечитал extras.
+		// (onResume -> closeAppHandler сработает только если приложение было свернуто)
+		if (_executionEnvironment != null
+				&& Intent.ACTION_VIEW.equals(intent.getAction())
+				&& intent.hasExtra("url")) {
+			_executionEnvironment.notifyNewIntent();
+		}
+	}
 
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
@@ -464,12 +485,6 @@ public final class MainActivity
             unbindService(_executionEnvironmentConnection);
         _mainView = null;
         super.onDestroy();
-    }
-
-    @Override
-    protected void onNewIntent(Intent intent) {
-        super.onNewIntent(intent);
-        Log.i(TAG, "onNewIntent");
     }
 
     @Override
