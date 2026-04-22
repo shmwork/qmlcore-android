@@ -579,7 +579,7 @@ public class Element extends BaseObject {
                                 paint = false;
                         } else if (child.roundClippingNeeded()) {
                             Path path = new Path();
-                            path.addRoundRect(state.baseX, state.baseY, state.baseX + childWidth, state.baseY + childHeight, _radius, _radius, Path.Direction.CW);
+                            path.addRoundRect(state.baseX, state.baseY, state.baseX + childWidth, state.baseY + childHeight, child._radius, child._radius, Path.Direction.CW);
                             if (!state.clipPath(path))
                                 paint = false;
                         } else {
