@@ -1,5 +1,7 @@
 package com.pureqml.android.runtime;
 
+import static com.pureqml.android.TypeConverter.toInteger;
+
 import android.animation.TimeInterpolator;
 import android.graphics.Paint;
 import android.graphics.Path;
@@ -455,6 +457,13 @@ public class Element extends BaseObject {
                 //Log.v(TAG, "will-change: " + value);
                 if (value.toString().contains("scroll-position"))
                     enableCache(true);
+                break;
+
+            case "border-radius":
+                try
+                { _radius = toInteger(value); }
+                catch(Exception ex)
+                { Log.w(TAG, "unsupported radius spec", ex); }
                 break;
 
             default:

@@ -17,7 +17,6 @@ import com.pureqml.android.TypeConverter;
 
 import static com.pureqml.android.TypeConverter.toColor;
 import static com.pureqml.android.TypeConverter.toFloat;
-import static com.pureqml.android.TypeConverter.toInteger;
 
 public final class Rectangle extends Element {
     private final static String TAG = "rt.Rectangle";
@@ -130,12 +129,6 @@ public final class Rectangle extends Element {
                 _gradientColors = null;
                 _gradientPositions = null;
                 _gradientOrientation = null;
-                break;
-            case "border-radius":
-                try
-                { _radius = toInteger(value); }
-                catch(Exception ex)
-                { Log.w(TAG, "unsupported radius spec", ex); }
                 break;
 
             default:
