@@ -497,14 +497,14 @@ public class Element extends BaseObject {
         return _radius > 0 && android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP;
     }
 
-    protected final void beginPaint(PaintState state) {
+    private void beginPaint(PaintState state) {
         _lastRect.setEmpty();
         _combinedRect.setEmpty();
         if (_paintDelegate != null)
             _paintDelegate.paint(state);
     }
 
-    protected final void endPaint(PaintState state) {
+    private void endPaint(PaintState state) {
         _lastRect.union(state.getDirtyRect());
     }
 
@@ -517,7 +517,7 @@ public class Element extends BaseObject {
     }
 
     @SuppressWarnings("unchecked")
-    public final void paintChildren(PaintState parent) {
+    private void paintChildren(PaintState parent) {
         if (_children == null)
             return;
 
@@ -613,10 +613,15 @@ public class Element extends BaseObject {
             _lastRect.union(child._lastRect);
         }
     }
+    protected void paintElementSpecificBeforeChildren(PaintState state) {}
+    protected void paintElementSpecificAfterChildren(PaintState state) {}
+    protected PaintState createChildrenPaintState(PaintState state) { return state; }
 
-    public void paint(PaintState state) {
+    public final void paint(PaintState state) {
         beginPaint(state);
-        paintChildren(state);
+        paintElementSpecificBeforeChildren(state);
+        paintChildren(createChildrenPaintState(state));
+        paintElementSpecificAfterChildren(state);
         endPaint(state);
     }
 

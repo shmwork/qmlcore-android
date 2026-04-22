@@ -233,9 +233,8 @@ public final class Text extends Element {
     }
 
     @Override
-    public void paint(PaintState state) {
+    public void paintElementSpecificBeforeChildren(PaintState state) {
         layout();
-        beginPaint(state);
         if (_text != null) {
             Rect rect = getRect();
             float textSize = _paint.getTextSize();
@@ -296,8 +295,6 @@ public final class Text extends Element {
                 }
             }
         }
-        paintChildren(state);
-        endPaint(state);
     }
 
     public void setText(String text) {

@@ -169,17 +169,22 @@ public final class Rectangle extends Element {
     }
 
     @Override
-    public void paint(PaintState state) {
-        beginPaint(state);
-        PaintState childrenState = null;
+    protected PaintState createChildrenPaintState(PaintState state) {
+        if (_outerBorder && _borderWidth > 0) {
+            int bw = (int)_borderWidth;
+            return new PaintState(state, bw, bw, 1.0f);
+        } else
+            return state;
+    }
 
+    @Override
+    public void paintElementSpecificBeforeChildren(PaintState state) {
         float opacity = state.opacity;
         Rect rect = getDstRect(state);
 
         if (_outerBorder && _borderWidth > 0) {
             int bw = (int)_borderWidth;
             rect.offset(bw, bw);
-            childrenState = new PaintState(state, bw, bw, 1.0f);
         }
 
         if (_background.getColor() != 0 || _gradientOrientation != null) {
@@ -220,8 +225,5 @@ public final class Rectangle extends Element {
                 }
             }
         }
-
-        paintChildren(childrenState != null? childrenState: state);
-        endPaint(state);
     }
 }
