@@ -625,7 +625,7 @@ public class Element extends BaseObject {
         endPaint(state);
     }
 
-    public Rect getScreenRect() {
+    protected final Rect getScreenRect() {
         Rect rect = getRect();
         Element el = _parent;
         while(el != null) {
@@ -876,13 +876,13 @@ public class Element extends BaseObject {
     public void focus() {}
     public void blur() {}
 
-    public Rect getDstRect(PaintState state) {
+    protected Rect getDstRect(PaintState state) {
         Rect rect = new Rect(0, 0, _rect.width(), _rect.height());
         rect.offset(state.baseX, state.baseY);
         return rect;
     }
 
-    static Paint patchAlpha(Paint paint, int alpha, float opacity) {
+    static protected Paint patchAlpha(Paint paint, int alpha, float opacity) {
         alpha = (int)(alpha * opacity);
         if (alpha <= 0)
             return null;
