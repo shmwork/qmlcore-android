@@ -170,8 +170,8 @@ public final class Rectangle extends Element {
 
     @Override
     protected PaintState createChildrenPaintState(PaintState state) {
-        if (_outerBorder && _borderWidth > 0) {
-            int bw = (int)_borderWidth;
+        int bw = (int)_borderWidth;
+        if (bw > 0) {
             return new PaintState(state, bw, bw, 1.0f);
         } else
             return state;
