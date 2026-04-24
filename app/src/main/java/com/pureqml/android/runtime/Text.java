@@ -314,7 +314,8 @@ public final class Text extends Element {
     static private final Pattern newLinePattern = Pattern.compile("<br.*?>");
 
     private String preprocess(String text) {
-        return text.replaceAll("\\s+", " ");
+        // return text.replaceAll("\\s+", " ");
+        return text;
     }
 
     private void layoutLine(int begin, int end, int maxWidth) {
