@@ -247,10 +247,7 @@ public final class Input extends Element {
     }
 
     @Override
-    public void paint(PaintState state) {
-        beginPaint(state);
-        paintChildren(state);
-
+    protected void paintElementSpecificAfterChildren(PaintState state) {
         Rect rect = getRect();
 
         if (!rect.isEmpty()) {
@@ -258,8 +255,6 @@ public final class Input extends Element {
             Log.i(TAG, "input layout " + rect);
             viewHolder.setRect(_env.getRootView(), rect);
         }
-
-        endPaint(state);
     }
 
     @Override

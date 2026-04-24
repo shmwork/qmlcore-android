@@ -17,7 +17,6 @@ import com.pureqml.android.TypeConverter;
 
 import static com.pureqml.android.TypeConverter.toColor;
 import static com.pureqml.android.TypeConverter.toFloat;
-import static com.pureqml.android.TypeConverter.toInteger;
 
 public final class Rectangle extends Element {
     private final static String TAG = "rt.Rectangle";
@@ -131,12 +130,6 @@ public final class Rectangle extends Element {
                 _gradientPositions = null;
                 _gradientOrientation = null;
                 break;
-            case "border-radius":
-                try
-                { _radius = toInteger(value); }
-                catch(Exception ex)
-                { Log.w(TAG, "unsupported radius spec", ex); }
-                break;
 
             default:
                 super.setStyle(name, value);
@@ -169,17 +162,22 @@ public final class Rectangle extends Element {
     }
 
     @Override
-    public void paint(PaintState state) {
-        beginPaint(state);
-        PaintState childrenState = null;
+    protected PaintState createChildrenPaintState(PaintState state) {
+        int bw = (int)_borderWidth;
+        if (bw > 0) {
+            return new PaintState(state, bw, bw, 1.0f);
+        } else
+            return state;
+    }
 
+    @Override
+    public void paintElementSpecificBeforeChildren(PaintState state) {
         float opacity = state.opacity;
         Rect rect = getDstRect(state);
 
         if (_outerBorder && _borderWidth > 0) {
             int bw = (int)_borderWidth;
             rect.offset(bw, bw);
-            childrenState = new PaintState(state, bw, bw, 1.0f);
         }
 
         if (_background.getColor() != 0 || _gradientOrientation != null) {
@@ -220,8 +218,5 @@ public final class Rectangle extends Element {
                 }
             }
         }
-
-        paintChildren(childrenState != null? childrenState: state);
-        endPaint(state);
     }
 }

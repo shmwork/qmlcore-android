@@ -328,9 +328,7 @@ public final class Image extends Element implements ImageLoadedCallback {
     }
 
     @Override
-    public void paint(PaintState state) {
-        beginPaint(state);
-
+    public void paintElementSpecificBeforeChildren(PaintState state) {
         if (_url != null) {
             Rect dst = getDstRect(state);
             Bitmap bitmap = null;
@@ -366,8 +364,5 @@ public final class Image extends Element implements ImageLoadedCallback {
             } else
                 Log.d(TAG, "null bitmap returned for " + _url);
         }
-
-        paintChildren(state);
-        endPaint(state);
     }
 }
