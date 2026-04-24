@@ -1,5 +1,7 @@
 package com.pureqml.android.runtime;
 
+import static com.pureqml.android.TypeConverter.toInteger;
+
 import android.animation.TimeInterpolator;
 import android.graphics.Paint;
 import android.graphics.Path;
@@ -457,6 +459,13 @@ public class Element extends BaseObject {
                     enableCache(true);
                 break;
 
+            case "border-radius":
+                try
+                { _radius = toInteger(value); }
+                catch(Exception ex)
+                { Log.w(TAG, "unsupported radius spec", ex); }
+                break;
+
             default:
                 if (Log.isLoggable(TAG, Log.VERBOSE))
                     Log.v(TAG, "ignoring setStyle " + name + ": " + value);
@@ -497,14 +506,14 @@ public class Element extends BaseObject {
         return _radius > 0 && android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP;
     }
 
-    protected final void beginPaint(PaintState state) {
+    private void beginPaint(PaintState state) {
         _lastRect.setEmpty();
         _combinedRect.setEmpty();
         if (_paintDelegate != null)
             _paintDelegate.paint(state);
     }
 
-    protected final void endPaint(PaintState state) {
+    private void endPaint(PaintState state) {
         _lastRect.union(state.getDirtyRect());
     }
 
@@ -517,7 +526,7 @@ public class Element extends BaseObject {
     }
 
     @SuppressWarnings("unchecked")
-    public final void paintChildren(PaintState parent) {
+    private void paintChildren(PaintState parent) {
         if (_children == null)
             return;
 
@@ -579,7 +588,7 @@ public class Element extends BaseObject {
                                 paint = false;
                         } else if (child.roundClippingNeeded()) {
                             Path path = new Path();
-                            path.addRoundRect(state.baseX, state.baseY, state.baseX + childWidth, state.baseY + childHeight, _radius, _radius, Path.Direction.CW);
+                            path.addRoundRect(state.baseX, state.baseY, state.baseX + childWidth, state.baseY + childHeight, child._radius, child._radius, Path.Direction.CW);
                             if (!state.clipPath(path))
                                 paint = false;
                         } else {
@@ -613,14 +622,19 @@ public class Element extends BaseObject {
             _lastRect.union(child._lastRect);
         }
     }
+    protected void paintElementSpecificBeforeChildren(PaintState state) {}
+    protected void paintElementSpecificAfterChildren(PaintState state) {}
+    protected PaintState createChildrenPaintState(PaintState state) { return state; }
 
-    public void paint(PaintState state) {
+    public final void paint(PaintState state) {
         beginPaint(state);
-        paintChildren(state);
+        paintElementSpecificBeforeChildren(state);
+        paintChildren(createChildrenPaintState(state));
+        paintElementSpecificAfterChildren(state);
         endPaint(state);
     }
 
-    public Rect getScreenRect() {
+    protected final Rect getScreenRect() {
         Rect rect = getRect();
         Element el = _parent;
         while(el != null) {
@@ -871,13 +885,13 @@ public class Element extends BaseObject {
     public void focus() {}
     public void blur() {}
 
-    public Rect getDstRect(PaintState state) {
+    protected Rect getDstRect(PaintState state) {
         Rect rect = new Rect(0, 0, _rect.width(), _rect.height());
         rect.offset(state.baseX, state.baseY);
         return rect;
     }
 
-    static Paint patchAlpha(Paint paint, int alpha, float opacity) {
+    static protected Paint patchAlpha(Paint paint, int alpha, float opacity) {
         alpha = (int)(alpha * opacity);
         if (alpha <= 0)
             return null;

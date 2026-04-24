@@ -40,10 +40,7 @@ public final class Spinner extends Element {
     }
 
     @Override
-    public void paint(PaintState state) {
-        beginPaint(state);
-        paintChildren(state);
-
+    public void paintElementSpecificAfterChildren(PaintState state) {
         Rect rect = getRect();
 
         if (!rect.isEmpty()) {
@@ -51,8 +48,6 @@ public final class Spinner extends Element {
             Log.v(TAG, "spinner layout " + rect);
             viewHolder.setRect(_env.getRootView(), rect);
         }
-
-        endPaint(state);
     }
 
 }
