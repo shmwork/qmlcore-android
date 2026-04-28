@@ -21,6 +21,8 @@ import com.pureqml.android.TypeConverter;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.concurrent.Executor;
+import java.util.HashMap;
+import java.util.Map;
 
 public final class Image extends Element implements ImageLoadedCallback {
     private final static String TAG = "rt.Image";
@@ -29,7 +31,6 @@ public final class Image extends Element implements ImageLoadedCallback {
     final Paint                 _paint;
 
     private enum Position { LeftOrTop, Center, RightOrBottom }
-
     private enum Mode { Percentage, Absolute, Cover, Contain }
 
     static int getPosition(Position position, int imageSize, int rectSize) {
@@ -43,24 +44,65 @@ public final class Image extends Element implements ImageLoadedCallback {
         }
     }
 
+    @Override
+    public void onImageLoadFailed(final URI url, final Throwable error) {
+        Executor executor = _env.getExecutor();
+        if (executor == null) {
+            Log.d(TAG, "skipping error callback, executor is dead");
+            return;
+        }
+
+        executor.execute(new SafeRunnable() {
+            @Override
+            public void doRun() {
+                Log.w(TAG, "image load failed " + url, error);
+
+                final V8Function callback;
+                synchronized (_callbacks) {
+                    callback = _callbacks.remove(url);
+                }
+
+                if (callback == null || callback.isReleased()) {
+                    return;
+                }
+
+                try (V8Array args = new V8Array(_env.getRuntime())) {
+                    args.push((Object) null);
+                    Object r = callback.call(null, args);
+                    if (r instanceof Releasable) {
+                        ((Releasable) r).release();
+                    }
+                } catch (Exception ex) {
+                    Log.w(TAG, "error callback failed", ex);
+                } finally {
+                    if (!callback.isReleased()) {
+                        callback.close();
+                    }
+                    update();
+                }
+            }
+        });
+    }
+
     private final class Background {
-        Mode        mode        = Mode.Absolute;
-        Position    position    = Position.LeftOrTop;
-        int         percentage  = 100;
-        int         size        = 0;
+        Mode     mode       = Mode.Absolute;
+        Position position   = Position.LeftOrTop;
+        int      percentage = 100;
+        int      size       = 0;
+        boolean  repeat     = false;
 
-        public boolean repeat   = false;
-
-        public void setPosition(String value) {
-            switch(value) {
+        void setPosition(String value) {
+            switch (value) {
                 case "left":
+                case "top":
                     position = Position.LeftOrTop;
-                    break;
-                case "right":
-                    position = Position.RightOrBottom;
                     break;
                 case "center":
                     position = Position.Center;
+                    break;
+                case "right":
+                case "bottom":
+                    position = Position.RightOrBottom;
                     break;
                 default:
                     Log.w(TAG, "invalid position: " + value);
@@ -69,23 +111,31 @@ public final class Image extends Element implements ImageLoadedCallback {
             }
         }
 
-        public void resetSize() {
+        void resetSize() {
             mode = Mode.Percentage;
             percentage = 100;
         }
 
-        public void resetPosition() {
-            position = Position.LeftOrTop;
-        }
-
-        public void setBackgroundSize(String value) {
-            if (value.endsWith("%")) {
-                mode = Mode.Percentage;
-                percentage = Integer.valueOf(value.substring(0, value.length() - 1), 10);
+        void setBackgroundSize(String value) {
+            if (value == null) {
+                resetSize();
                 return;
             }
 
-            switch(value) {
+            value = value.trim();
+
+            if (value.endsWith("%")) {
+                mode = Mode.Percentage;
+                try {
+                    percentage = Integer.parseInt(value.substring(0, value.length() - 1), 10);
+                } catch (Exception e) {
+                    percentage = 100;
+                    Log.w(TAG, "invalid percentage background-size: " + value, e);
+                }
+                return;
+            }
+
+            switch (value) {
                 case "auto":
                     resetSize();
                     break;
@@ -101,8 +151,9 @@ public final class Image extends Element implements ImageLoadedCallback {
                         mode = Mode.Absolute;
                     } catch (Exception e) {
                         resetSize();
-                        Log.w(TAG, "parsing background size failed: ", e);
+                        Log.w(TAG, "parsing background size failed: " + value, e);
                     }
+                    break;
             }
         }
 
@@ -110,63 +161,72 @@ public final class Image extends Element implements ImageLoadedCallback {
             return Image.getPosition(position, imageSize, rectSize);
         }
 
-        public boolean needClip(Background y) {
-            return repeat || y.repeat || mode == Mode.Cover;
+        boolean needClip(Background y) {
+            return repeat || y.repeat || mode == Mode.Cover || y.mode == Mode.Cover;
         }
 
-        public void merge(Background y, Rect dst, Rect src) {
-            //Log.v(TAG, "merge in " + mode + " " + dst + " ← " + src);
-            float aspect;
-            float wx, hx;
-            final int dstWidth = dst.width(), dstHeight = dst.height();
-            final int srcWidth = src.width(), srcHeight = src.height();
-            int dx, dy;
+        void merge(Background y, Rect dst, Rect src) {
+            int containerLeft = dst.left;
+            int containerTop = dst.top;
+            int containerWidth = dst.width();
+            int containerHeight = dst.height();
 
-            switch(mode) {
+            int drawWidth = containerWidth;
+            int drawHeight = containerHeight;
+
+            switch (mode) {
                 case Percentage:
-                    dx = dstWidth - (dstWidth * percentage) / 100;
-                    dy = dstHeight - (dstHeight * y.percentage) / 100;
-                    dst.left += dx / 2;
-                    dst.right -= (dx - dx / 2);
-                    dst.top += dy / 2;
-                    dst.bottom -= (dy - dy / 2);
+                    drawWidth = (containerWidth * percentage) / 100;
                     break;
                 case Absolute:
-                    dst.right = dst.left + size;
-                    dst.bottom = dst.top + y.size;
+                    drawWidth = size;
                     break;
                 case Contain:
-                case Cover:
-                    wx = 1.0f * dstWidth / srcWidth;
-                    hx = 1.0f * dstHeight / srcHeight;
-                    float x = mode == Mode.Contain? Math.min(wx, hx): Math.max(wx, hx);
-                    dx = dstWidth - (int)(srcWidth * x);
-                    dy = dstHeight - (int)(srcHeight * x);
-                    dst.left += dx / 2;
-                    dst.right -= (dx - dx / 2);
-                    dst.top += dy / 2;
-                    dst.bottom -= (dy - dy / 2);
+                case Cover: {
+                    float wx = 1.0f * containerWidth / src.width();
+                    float hx = 1.0f * containerHeight / src.height();
+                    float scale = mode == Mode.Contain ? Math.min(wx, hx) : Math.max(wx, hx);
+                    drawWidth = Math.round(src.width() * scale);
+                    drawHeight = Math.round(src.height() * scale);
                     break;
-                default:
-                    break;
+                }
             }
-            //Log.v(TAG, "merge out " + mode + " " + dst + " ← " + src);
+
+            switch (y.mode) {
+                case Percentage:
+                    drawHeight = (containerHeight * y.percentage) / 100;
+                    break;
+                case Absolute:
+                    drawHeight = y.size;
+                    break;
+                case Contain:
+                case Cover: {
+                    float wx = 1.0f * containerWidth / src.width();
+                    float hx = 1.0f * containerHeight / src.height();
+                    float scale = y.mode == Mode.Contain ? Math.min(wx, hx) : Math.max(wx, hx);
+                    drawWidth = Math.round(src.width() * scale);
+                    drawHeight = Math.round(src.height() * scale);
+                    break;
+                }
+            }
+
+            int left = containerLeft + getPosition(drawWidth, containerWidth);
+            int top = containerTop + y.getPosition(drawHeight, containerHeight);
+
+            dst.left = left;
+            dst.top = top;
+            dst.right = left + drawWidth;
+            dst.bottom = top + drawHeight;
         }
     }
-    final Background                  _backgroundX = new Background();
-    final Background                  _backgroundY = new Background();
+
+    final Background _backgroundX = new Background();
+    final Background _backgroundY = new Background();
 
     public Image(IExecutionEnvironment env) {
         super(env);
         _paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
         _paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.SRC_OVER));
-    }
-
-    private void setCallback(final V8Function callback) {
-        if (_callback != null) {
-            _callback.close();
-        }
-        _callback = callback;
     }
 
     @Override
@@ -219,6 +279,8 @@ public final class Image extends Element implements ImageLoadedCallback {
     }
 
     private static final String regexWS = "\\s+";
+    private int _backgroundColor = 0x00000000; // transparent
+    private boolean _hasBackgroundColor = false;
 
     @Override
     protected void setStyle(String name, Object value) {
@@ -234,6 +296,19 @@ public final class Image extends Element implements ImageLoadedCallback {
             case "background-position-y":
                 _backgroundY.setPosition(value.toString());
                 break;
+            case "background-position": {
+                String[] pos = value.toString().trim().split(regexWS);
+                if (pos.length == 1) {
+                    _backgroundX.setPosition(pos[0]);
+                    _backgroundY.setPosition(pos[0]);
+                } else if (pos.length >= 2) {
+                    _backgroundX.setPosition(pos[0]);
+                    _backgroundY.setPosition(pos[1]);
+                } else {
+                    Log.w(TAG, "malformed background-position: " + value);
+                }
+                break;
+            }
             case "background-size": {
                 String[] size = value.toString().split(regexWS);
                 if (size.length == 1) {
@@ -269,6 +344,16 @@ public final class Image extends Element implements ImageLoadedCallback {
                 }
                 break;
             }
+            case "background-color": {
+                try {
+                    _backgroundColor = android.graphics.Color.parseColor(value.toString());
+                    _hasBackgroundColor = true;
+                } catch (Exception e) {
+                    _hasBackgroundColor = false;
+                    Log.w(TAG, "invalid background-color: " + value, e);
+                }
+                break;
+            }
             default:
                 super.setStyle(name, value);
                 return;
@@ -287,14 +372,13 @@ public final class Image extends Element implements ImageLoadedCallback {
             @Override
             public void doRun() {
                 Log.v(TAG, "on image loaded " + url + ", current url: " + _url);
-                if (_url == null || !_url.equals(url)) {
-                    return;
+
+                final V8Function callback;
+                synchronized (_callbacks) {
+                    callback = _callbacks.get(url);
                 }
 
-                Log.v(TAG, "image bitmap: " + _url + " -> " + bitmap);
-
-                if (_callback == null || _callback.isReleased()) {
-                    update();
+                if (callback == null || callback.isReleased()) {
                     return;
                 }
 
@@ -304,24 +388,21 @@ public final class Image extends Element implements ImageLoadedCallback {
                         metrics.add("width", bitmap.getWidth());
                         metrics.add("height", bitmap.getHeight());
                         args.push(metrics);
-
-                        try {
-                            _env.invokeVoidCallback(_callback, null, args);
-                        } catch (Exception ex) {
-                            Log.w(TAG, "callback failed: ", ex);
-                        }
                         metrics.close();
                     } else {
-                        args.push((Object) null);
-                        try {
-                            _env.invokeVoidCallback(_callback, null, args);
-                        } catch (Exception ex) {
-                            Log.w(TAG, "callback failed: ", ex);
-                        }
+                        args.push((Object) null); // <-- Отдаём null для ошибки
                     }
-                    setCallback(null);
+
+                    try {
+                        _env.invokeVoidCallback(callback, null, args);
+                    } catch (Exception ex) {
+                        Log.w(TAG, "callback failed: ", ex);
+                    }
                 } finally {
-                    update();
+                    if (!callback.isReleased()) {
+                        callback.close();
+                    }
+                    update(); // <-- Принудительно обновляем состояние
                 }
             }
         });
@@ -329,40 +410,79 @@ public final class Image extends Element implements ImageLoadedCallback {
 
     @Override
     public void paintElementSpecificBeforeChildren(PaintState state) {
-        if (_url != null) {
-            Rect dst = getDstRect(state);
-            Bitmap bitmap = null;
+        Rect dst = getDstRect(state);
 
-            try {
-                bitmap = _env.getImageLoader().getBitmap(_url);
-            } catch(Exception ex) {
-                Log.w(TAG, "image loading failed", ex);
+        if (_hasBackgroundColor) {
+            Paint bg = new Paint();
+            bg.setColor(_backgroundColor);
+            state.drawRect(dst, bg);
+        }
+
+        if (_url == null) {
+            return;
+        }
+
+        Bitmap bitmap = null;
+        try {
+            bitmap = _env.getImageLoader().getBitmap(_url);
+        } catch (Exception ex) {
+            Log.w(TAG, "image loading failed", ex);
+        }
+
+        if (bitmap == null) {
+            Paint bg = new Paint();
+            bg.setColor(_backgroundColor);
+            state.drawRect(dst, bg);
+            return;
+        }
+
+        _paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.SRC_OVER));
+        Paint paint = patchAlpha(_paint, 255, state.opacity);
+        if (paint == null) {
+            return;
+        }
+
+        Rect src = new Rect(0, 0, bitmap.getWidth(), bitmap.getHeight());
+        Rect drawDst = new Rect(dst);
+        _backgroundX.merge(_backgroundY, drawDst, src);
+
+        boolean repeatX = _backgroundX.repeat;
+        boolean repeatY = _backgroundY.repeat;
+
+        if (!repeatX && !repeatY) {
+            state.drawBitmap(bitmap, src, drawDst, paint);
+            return;
+        }
+
+        int tileW = drawDst.width();
+        int tileH = drawDst.height();
+        if (tileW <= 0 || tileH <= 0) {
+            Log.w(TAG, "invalid tile size: " + drawDst);
+            return;
+        }
+
+        state.save();
+        try {
+            if (!state.clipRect(dst)) {
+                return;
             }
 
-            if (bitmap != null) {
-                _paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.SRC_OVER));
+            int startX = repeatX ? dst.left : drawDst.left;
+            int startY = repeatY ? dst.top : drawDst.top;
 
-                Paint paint = patchAlpha(_paint, 255, state.opacity);
-                if (paint != null) {
-                    boolean clip = _backgroundX.needClip(_backgroundY);
-                    boolean doPaint = true;
-                    if (clip) {
-                        state.save();
-                        if (!state.clipRect(dst))
-                            doPaint = false;
-                    }
+            int endX = repeatX ? dst.right : drawDst.right;
+            int endY = repeatY ? dst.bottom : drawDst.bottom;
 
-                    if (doPaint) {
-                        Rect src = new Rect(0, 0, bitmap.getWidth(), bitmap.getHeight());
-                        _backgroundX.merge(_backgroundY, dst, src);
-                        state.drawBitmap(bitmap, src, dst, paint);
-                    }
-
-                    if (clip)
-                        state.restore();
+            for (int y = startY; y < endY; y += tileH) {
+                for (int x = startX; x < endX; x += tileW) {
+                    Rect tileDst = new Rect(x, y, x + tileW, y + tileH);
+                    state.drawBitmap(bitmap, src, tileDst, paint);
+                    if (!repeatX) break;
                 }
-            } else
-                Log.d(TAG, "null bitmap returned for " + _url);
+                if (!repeatY) break;
+            }
+        } finally {
+            state.restore();
         }
     }
 }
