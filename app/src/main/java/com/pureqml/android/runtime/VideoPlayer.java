@@ -650,7 +650,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
             @Override
             public void onLoadError(int windowIndex, @Nullable MediaSource.MediaPeriodId mediaPeriodId, @NonNull LoadEventInfo loadEventInfo, @NonNull MediaLoadData mediaLoadData, @NonNull IOException error, boolean wasCanceled) {
                 Log.w(TAG, "onLoadError");
-                VideoPlayer.this.emit("error", "Source load error: " + error.getLocalizedMessage());
+                // VideoPlayer.this.emit("error", "Source load error: " + error.getLocalizedMessage());
             }
         });
 
