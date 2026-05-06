@@ -10,5 +10,6 @@ public interface IRenderer {
     void setFullScreen(boolean enable);
     void lockOrientation(String orientation);
     void closeApp();
+	void moveTaskToBack();
     String getIntentParam(String text);
 }

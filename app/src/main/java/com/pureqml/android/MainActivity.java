@@ -180,6 +180,10 @@ public final class MainActivity
                     public void closeApp() {
                         finish();
                     }
+                    @Override
+                    public void moveTaskToBack() {
+						MainActivity.this.moveTaskToBack(true);
+                    }
                 };
                 if (_executionEnvironment != null) {
                     _executionEnvironment.setSurfaceHolder(holder);

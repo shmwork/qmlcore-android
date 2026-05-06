@@ -334,6 +334,12 @@ public final class ExecutionEnvironment extends Service
         }, "closeApp");
 
         v8FD.registerJavaMethod((v8Object, v8Array) -> {
+            Log.i(TAG, "moveTaskToBack: " + v8Array);
+            if (_renderer != null)
+                _renderer.moveTaskToBack();
+        }, "moveTaskToBack");
+
+        v8FD.registerJavaMethod((v8Object, v8Array) -> {
             if (v8Array.length() < 2)
                 throw new RuntimeException("style() requires two arguments: selector and rules");
             String selector = v8Array.get(0).toString();
