@@ -97,6 +97,7 @@ public class Element extends BaseObject {
     }
 
     String getTag() { return "div"; }
+    protected final boolean getClip() { return _clip; }
 
     public void animate() {
         if (_scrollVelocity == null)

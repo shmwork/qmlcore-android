@@ -3,6 +3,7 @@ package com.pureqml.android.runtime;
 import android.graphics.Color;
 import android.graphics.LinearGradient;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.PorterDuff;
 import android.graphics.PorterDuffXfermode;
 import android.graphics.Rect;
@@ -163,9 +164,19 @@ public final class Rectangle extends Element {
 
     @Override
     protected PaintState createChildrenPaintState(PaintState state) {
-        int bw = (int)_borderWidth;
+        float bw = _borderWidth;
         if (bw > 0) {
-            return new PaintState(state, bw, bw, 1.0f);
+            if (_radius > 0 && getClip()) {
+                Path path = new Path();
+                Rect rect = getRect();
+                float r = _outerBorder? _radius: _radius - bw / 2.0f;
+                path.addRoundRect(state.baseX + bw, state.baseY + bw, state.baseX + rect.width() - bw, state.baseY + rect.height() - bw, r, r, Path.Direction.CW);
+                if (!state.clipPath(path))
+                    return state;
+            }
+
+            int offset = (int)bw;
+            return new PaintState(state, offset, offset, 1.0f);
         } else
             return state;
     }
