@@ -51,6 +51,8 @@ public final class MainActivity
     boolean                         _keyDownHandled;
     boolean                         _showSoftKeyboard;
     InputMethodManager              _imm;
+    private boolean _isResumed = false;
+    private boolean _isSurfaceReady = false;
 
     private final ServiceConnection _executionEnvironmentConnection = new ServiceConnection() {
         public void onServiceConnected(ComponentName className, IBinder service) {
@@ -185,15 +187,15 @@ public final class MainActivity
 						MainActivity.this.moveTaskToBack(true);
                     }
                 };
+                _isSurfaceReady = true;
+                _surfaceFrame = holder.getSurfaceFrame();
                 if (_executionEnvironment != null) {
                     _executionEnvironment.setSurfaceHolder(holder);
-                    Rect frame = holder.getSurfaceFrame();
-                    if (frame != null) {
-                        _surfaceFrame = frame;
-                        _executionEnvironment.setSurfaceFrame(frame);
+                    if (_surfaceFrame != null) {
+                        _executionEnvironment.setSurfaceFrame(_surfaceFrame);
                     }
-                    _executionEnvironment.setRenderer(_uiRenderer);
                 }
+                syncLifecycle();
             }
         }
 
@@ -373,6 +375,23 @@ public final class MainActivity
         return false;
     }
 
+    private void syncLifecycle() {
+        if (_executionEnvironment == null) return;
+        if (_isResumed && _isSurfaceReady) {
+            _executionEnvironment.acquireResource();
+            _executionEnvironment.resume();
+            _executionEnvironment.setRenderer(_uiRenderer);
+            synchronized (MainActivity.this) {
+                if (_executionEnvironment != null) {
+                    _executionEnvironment.update(_executionEnvironment.getRootElement());
+                    _executionEnvironment.paint();
+                }
+            }
+        } else {
+            _executionEnvironment.pause();
+        }
+    }
+
     @Override
     protected void onStop() {
         super.onStop();
@@ -387,24 +406,24 @@ public final class MainActivity
 	protected void onUserLeaveHint() {
 		super.onUserLeaveHint();
 		Log.i(TAG, "onUserLeaveHint");
-		if (_executionEnvironment != null)
-			_executionEnvironment.pause(); 
+		_isResumed = false;
+		syncLifecycle();
 	}
 
     @Override
     protected void onPause() {
         super.onPause();
         Log.i(TAG, "onPause");
-        if (_executionEnvironment != null)
-            _executionEnvironment.pause();
+        _isResumed = false;
+        syncLifecycle();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         Log.i(TAG, "onResume");
-        if (_executionEnvironment != null)
-            _executionEnvironment.resume();
+        _isResumed = true;
+        syncLifecycle();
     }
 
     @Override
