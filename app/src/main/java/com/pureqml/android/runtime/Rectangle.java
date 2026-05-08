@@ -139,7 +139,7 @@ public final class Rectangle extends Element {
         update();
     }
 
-    private void unionWithBorder(Rect rect) {
+    protected void adjustRect(Rect rect) {
         if (_outerBorder && _borderWidth > 0) {
             int width = (int)Math.ceil(_borderWidth);
             int inset = -width;
@@ -153,12 +153,7 @@ public final class Rectangle extends Element {
             return super.createRedrawRect();
 
         Rect rect = getScreenRect();
-        if (_outerBorder && _borderWidth > 0) {
-            int width = (int)Math.ceil(_borderWidth);
-            rect.offset(width, width);
-        }
-
-        unionWithBorder(rect);
+        adjustRect(rect);
         return rect;
     }
 
@@ -169,7 +164,7 @@ public final class Rectangle extends Element {
             if (_radius > 0 && getClip()) {
                 Path path = new Path();
                 Rect rect = getRect();
-                float r = _outerBorder? _radius: _radius - bw / 2.0f;
+                float r = _radius - bw / 2.0f;
                 path.addRoundRect(state.baseX + bw, state.baseY + bw, state.baseX + rect.width() - bw, state.baseY + rect.height() - bw, r, r, Path.Direction.CW);
                 if (!state.clipPath(path))
                     return state;

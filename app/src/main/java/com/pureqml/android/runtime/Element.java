@@ -206,9 +206,12 @@ public class Element extends BaseObject {
         }
     }
 
+    protected void adjustRect(Rect rect) {}
+
     public final Rect getRect()
     {
         Rect rect = new Rect(_rect);
+        adjustRect(rect);
         if (_translate != null)
             rect.offset(_translate.x, _translate.y);
         return rect;
