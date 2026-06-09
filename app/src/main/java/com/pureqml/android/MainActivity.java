@@ -184,7 +184,7 @@ public final class MainActivity
                     }
                     @Override
                     public void moveTaskToBack() {
-						MainActivity.this.moveTaskToBack(true);
+                        MainActivity.this.moveTaskToBack(true);
                     }
                 };
                 _isSurfaceReady = true;
@@ -398,17 +398,17 @@ public final class MainActivity
         Log.i(TAG, "stopping main activity...");
         if (_executionEnvironment != null) {
             _executionEnvironment.releaseResource();
-			_executionEnvironment.pause();
-		}
+            _executionEnvironment.pause();
+        }
     }
 
-	@Override
-	protected void onUserLeaveHint() {
-		super.onUserLeaveHint();
-		Log.i(TAG, "onUserLeaveHint");
-		_isResumed = false;
-		syncLifecycle();
-	}
+    @Override
+    protected void onUserLeaveHint() {
+        super.onUserLeaveHint();
+        Log.i(TAG, "onUserLeaveHint");
+        _isResumed = false;
+        syncLifecycle();
+    }
 
     @Override
     protected void onPause() {
@@ -441,6 +441,12 @@ public final class MainActivity
             unbindService(_executionEnvironmentConnection);
         _mainView = null;
         super.onDestroy();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        Log.i(TAG, "onNewIntent");
     }
 
     @Override
