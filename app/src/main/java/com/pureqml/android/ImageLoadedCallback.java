@@ -6,4 +6,5 @@ import java.net.URI;
 
 public interface ImageLoadedCallback {
     void onImageLoaded(URI url, Bitmap bitmap);
+    void onImageLoadFailed(URI url, Throwable error);
 }

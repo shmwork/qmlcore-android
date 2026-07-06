@@ -62,33 +62,22 @@ public final class ImageLoader {
     }
 
     private static class CallbackHolder {
-        private final HashSet<WeakReference<ImageLoadedCallback>> _callbacks = new HashSet<>();
+        private final LinkedList<ImageLoadedCallback> _callbacks = new LinkedList<>();
         public void subscribe(ImageLoadedCallback callback) {
             synchronized (_callbacks) {
-                _callbacks.add(new WeakReference<>(callback));
+                _callbacks.add(callback);
             }
         }
         public void unsubscribe(ImageLoadedCallback callback) {
             synchronized (_callbacks) {
-                Iterator<WeakReference<ImageLoadedCallback>> it = _callbacks.iterator();
-                while (it.hasNext()) {
-                    ImageLoadedCallback el = it.next().get();
-                    if (el == null || el == callback)
-                        it.remove();
-                }
+                _callbacks.remove(callback);
             }
         }
+
         void onImageLoaded(URI uri, Bitmap bitmap) {
-            LinkedList<ImageLoadedCallback> callbacks = new LinkedList<>();
+            LinkedList<ImageLoadedCallback> callbacks;
             synchronized (_callbacks) {
-                Iterator<WeakReference<ImageLoadedCallback>> it = _callbacks.iterator();
-                while(it.hasNext()) {
-                    ImageLoadedCallback el = it.next().get();
-                    if (el != null) {
-                        callbacks.push(el);
-                    } else
-                        it.remove();
-                }
+                callbacks = new LinkedList<>(_callbacks);
             }
             for(ImageLoadedCallback callback : callbacks) {
                 try {
@@ -98,7 +87,21 @@ public final class ImageLoader {
                 }
             }
         }
-    };
+
+        void onImageLoadFailed(URI uri, Throwable error) {
+            LinkedList<ImageLoadedCallback> callbacks;
+            synchronized (_callbacks) {
+                callbacks = new LinkedList<>(_callbacks);
+            }
+            for (ImageLoadedCallback callback : callbacks) {
+                try {
+                    callback.onImageLoadFailed(uri, error);
+                } catch (Exception ex) {
+                    Log.w(TAG, "onImageLoadFailed " + uri + " failed", ex);
+                }
+            }
+        }
+    }
 
     private CallbackHolder getCallbackHolder(URI url) {
         synchronized (_callbacks) {
@@ -158,36 +161,50 @@ public final class ImageLoader {
 
         @Override
         public void doRun() {
-            Log.i(TAG, "starting loading task on " + _url);
+            Bitmap bitmap = null;
+            Throwable error = null;
             try {
                 InputStream rawStream;
                 if (_url.getScheme().equals("file")) {
                     String path = _url.getPath();
                     int pos = 0;
-                    while(pos < path.length() && path.charAt(pos) == '/')
+                    while (pos < path.length() && path.charAt(pos) == '/')
                         ++pos;
-                    rawStream = _env.getAssets().open(path.substring(pos)); //strip leading slash
-                } else
+                    rawStream = _env.getAssets().open(path.substring(pos));
+                } else {
                     rawStream = _url.toURL().openStream();
+                }
+
                 try {
                     _holder.load(rawStream);
+                    bitmap = _holder.getBitmap();
+                    if (bitmap == null) {
+                        error = new RuntimeException("decoded bitmap is null");
+                    }
                 } finally {
                     rawStream.close();
                 }
-            } catch(Exception ex) {
+            } catch (Exception ex) {
                 Log.e(TAG, "image loading failed", ex);
+                error = ex;
             } finally {
-                Bitmap bitmap;
                 synchronized (_cache) {
                     _cache.remove(_url);
                     _holder.finish();
                     bitmap = getNotifyBitmap();
-                    _cache.put(_url, _holder);
+                    if (bitmap != null) {
+                        _cache.put(_url, _holder);
+                    }
                 }
-                getCallbackHolder(_url).onImageLoaded(_url, bitmap);
-                Log.v(TAG, "cache size: " + _cache.size());
+                CallbackHolder callbacks = getCallbackHolder(_url);
+                if (callbacks != null) {
+                    if (bitmap != null) {
+                        callbacks.onImageLoaded(_url, bitmap);
+                    } else {
+                        callbacks.onImageLoadFailed(_url, error);
+                    }
+                }
             }
-            Log.i(TAG, "finished loading task on " + _url);
         }
     }
 
