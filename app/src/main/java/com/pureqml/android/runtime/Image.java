@@ -140,12 +140,18 @@ public final class Image extends Element implements ImageLoadedCallback {
                     wx = 1.0f * dstWidth / srcWidth;
                     hx = 1.0f * dstHeight / srcHeight;
                     float x = mode == Mode.Contain? Math.min(wx, hx): Math.max(wx, hx);
-                    dx = dstWidth - (int)(srcWidth * x);
-                    dy = dstHeight - (int)(srcHeight * x);
-                    dst.left += dx / 2;
-                    dst.right -= (dx - dx / 2);
-                    dst.top += dy / 2;
-                    dst.bottom -= (dy - dy / 2);
+
+                    int scaledWidth = Math.round(srcWidth * x);
+                    int scaledHeight = Math.round(srcHeight * x);
+
+                    dx = dstWidth - scaledWidth;
+                    dy = dstHeight - scaledHeight;
+
+                    dst.left += _backgroundX.getPosition(scaledWidth, dstWidth);
+                    dst.top += y.getPosition(scaledHeight, dstHeight);
+
+                    dst.right = dst.left + scaledWidth;
+                    dst.bottom = dst.top + scaledHeight;
                     break;
                 default:
                     break;
