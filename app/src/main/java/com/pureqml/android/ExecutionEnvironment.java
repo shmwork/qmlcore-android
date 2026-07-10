@@ -308,6 +308,9 @@ public final class ExecutionEnvironment extends Service
                     if (_renderer != null)
                         _renderer.keepScreenOn(_keepScreenOn);
                     break;
+                case "software-decoder":
+                    VideoPlayer.setSoftwareDecoder(TypeConverter.toBoolean(v8Array.get(1)));
+                    break;
                 default:
                     Log.w(TAG, "skipping device feature " + v8Array);
             }

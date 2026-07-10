@@ -40,6 +40,7 @@ import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.Renderer;
 import androidx.media3.exoplayer.hls.DefaultHlsExtractorFactory;
 import androidx.media3.exoplayer.hls.HlsMediaSource;
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
 import androidx.media3.exoplayer.source.BaseMediaSource;
 import androidx.media3.exoplayer.source.BehindLiveWindowException;
 import androidx.media3.exoplayer.source.LoadEventInfo;
@@ -64,8 +65,11 @@ import com.pureqml.android.SafeRunnable;
 import com.pureqml.android.TypeConverter;
 
 import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 
@@ -229,6 +233,9 @@ public final class VideoPlayer extends BaseObject implements IResource {
 
     private static final String TAG = "VideoPlayer";
     private static final int PollingInterval = 500; //ms
+    private static final Object INSTANCES_LOCK = new Object();
+    private static final List<WeakReference<VideoPlayer>> INSTANCES = new ArrayList<>();
+    private static volatile boolean preferSoftwareDecoder = false;
 
     private ExoPlayer player;
     private final SurfaceView           surfaceView;
@@ -397,8 +404,64 @@ public final class VideoPlayer extends BaseObject implements IResource {
         period = new Timeline.Period();
 
         _env.register(this);
+        synchronized (INSTANCES_LOCK) {
+            INSTANCES.add(new WeakReference<>(this));
+        }
 
         acquireResource();
+    }
+
+    public static void setSoftwareDecoder(boolean enable) {
+        Log.i(TAG, "setSoftwareDecoder " + enable);
+        if (preferSoftwareDecoder == enable)
+            return;
+        preferSoftwareDecoder = enable;
+
+        List<VideoPlayer> players = new ArrayList<>();
+        synchronized (INSTANCES_LOCK) {
+            Iterator<WeakReference<VideoPlayer>> it = INSTANCES.iterator();
+            while (it.hasNext()) {
+                VideoPlayer player = it.next().get();
+                if (player == null)
+                    it.remove();
+                else
+                    players.add(player);
+            }
+        }
+        for (VideoPlayer player : players)
+            player.recreateWithCurrentDecoderMode();
+    }
+
+    public static boolean isSoftwareDecoder() {
+        return preferSoftwareDecoder;
+    }
+
+    private void recreateWithCurrentDecoderMode() {
+        handler.post(new SafeRunnable() {
+            @Override
+            protected void doRun() {
+                if (player == null)
+                    return;
+
+                long positionMs = player.getCurrentPosition();
+                boolean playWhenReady = player.getPlayWhenReady();
+                releaseResourceImpl();
+                acquireResourceImpl();
+                // setSource() posts prepare asynchronously on this handler; restore after it.
+                final long restorePosition = positionMs;
+                final boolean restorePlayWhenReady = playWhenReady;
+                handler.post(new SafeRunnable() {
+                    @Override
+                    protected void doRun() {
+                        if (player == null)
+                            return;
+                        if (restorePosition > 0)
+                            player.seekTo(restorePosition);
+                        player.setPlayWhenReady(restorePlayWhenReady);
+                    }
+                });
+            }
+        });
     }
 
     public void emit(String name, Object ... args) {
@@ -472,9 +535,15 @@ public final class VideoPlayer extends BaseObject implements IResource {
                         .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, /* disabled= */ true)
         );
 
+        CustomRenderersFactory renderersFactory = new CustomRenderersFactory(context, new CustomTextOutput());
+        renderersFactory.setMediaCodecSelector(
+                preferSoftwareDecoder ? MediaCodecSelector.PREFER_SOFTWARE : MediaCodecSelector.DEFAULT);
+        renderersFactory.setEnableDecoderFallback(true);
+        Log.i(TAG, "creating ExoPlayer, softwareDecoder=" + preferSoftwareDecoder);
+
         player = new ExoPlayer.Builder(context)
                 .setTrackSelector(trackSelector)
-                .setRenderersFactory(new CustomRenderersFactory(context, new CustomTextOutput()))
+                .setRenderersFactory(renderersFactory)
                 .setLoadControl(loadControl)
                 .setLooper(handler.getLooper())
                 .build();
@@ -957,5 +1026,13 @@ public final class VideoPlayer extends BaseObject implements IResource {
         super.discard();
         viewHolder.discard(_env.getRootView());
         releaseResource();
+        synchronized (INSTANCES_LOCK) {
+            Iterator<WeakReference<VideoPlayer>> it = INSTANCES.iterator();
+            while (it.hasNext()) {
+                VideoPlayer player = it.next().get();
+                if (player == null || player == this)
+                    it.remove();
+            }
+        }
     }
 }
