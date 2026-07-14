@@ -142,6 +142,7 @@ public final class ExecutionEnvironment extends Service
     private DisplayMetrics              _displayMetrics;
     private ViewGroup                   _rootView;
     private boolean                     _paintScheduled;
+    private boolean                     _hardwarePaintDisabled;
     private int                         _eventId;
     private boolean                     _blockInput;
     private View                        _focusedView;
@@ -888,10 +889,7 @@ public final class ExecutionEnvironment extends Service
 
     @Override
     public void update(Element el) {
-        if (el == null)
-            return;
-
-        if (!_active)
+        if (el == null || !_active)
             return;
 
         synchronized (_updatedElements) {
@@ -923,23 +921,64 @@ public final class ExecutionEnvironment extends Service
         }
     }
 
+    private static final Paint SURFACE_CLEAR_PAINT = new Paint();
+    static {
+        SURFACE_CLEAR_PAINT.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.CLEAR));
+    }
 
-    public void paint(final SurfaceHolder holder) {
-        if (_rootElement == null) {
-            Log.w(TAG, "paint skip: rootElement=null");
-            return;
-        }
-        if (holder == null) {
-            Log.w(TAG, "paint skip: holder is null");
-            return;
+    /**
+     * GPU path (API 23+): full-surface hardware canvas.
+     * Skips expensive getRedrawRect union and software rasterization — the main CPU sink.
+     * Falls back to software partial updates if hardware canvas is unavailable.
+     */
+    private boolean paintHardware(Surface surface) {
+        if (_hardwarePaintDisabled || Build.VERSION.SDK_INT < Build.VERSION_CODES.M)
+            return false;
+        if (_surfaceGeometry == null || _surfaceGeometry.isEmpty())
+            return false;
+
+        synchronized (_updatedElements) {
+            if (_updatedElements.isEmpty())
+                return true;
         }
 
-        Surface surface = holder.getSurface();
-        if (surface == null || !surface.isValid()) {
-            Log.w(TAG, "paint skip: surface invalid surface=" + surface);
-            return;
-        }
+        Canvas canvas = null;
+        boolean clearedDirty = false;
+        try {
+            canvas = surface.lockHardwareCanvas();
+            if (canvas == null)
+                return false;
 
+            synchronized (_updatedElements) {
+                _updatedElements.clear();
+            }
+            clearedDirty = true;
+
+            canvas.drawRect(_surfaceGeometry, SURFACE_CLEAR_PAINT);
+            _rootElement.paint(new PaintState(canvas));
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "hardware paint failed, falling back to software", e);
+            _hardwarePaintDisabled = true;
+            if (clearedDirty && _rootElement != null) {
+                synchronized (_updatedElements) {
+                    _updatedElements.add(_rootElement);
+                }
+            }
+            return false;
+        } finally {
+            if (canvas != null) {
+                try {
+                    surface.unlockCanvasAndPost(canvas);
+                } catch (Exception e) {
+                    Log.e(TAG, "hardware unlockCanvasAndPost failed", e);
+                    _hardwarePaintDisabled = true;
+                }
+            }
+        }
+    }
+
+    private void paintSoftware(SurfaceHolder holder) {
         Rect rect = popDirtyRect();
         if (rect == null) {
             Log.v(TAG, "paint skip: no dirty rect");
@@ -950,15 +989,8 @@ public final class ExecutionEnvironment extends Service
         try {
             canvas = holder.lockCanvas(rect);
             if (canvas != null) {
-                PaintState paint = new PaintState(canvas);
-
-                {
-                    Paint bgPaint = new Paint();
-                    bgPaint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.CLEAR));
-                    canvas.drawRect(rect, bgPaint);
-                }
-
-                _rootElement.paint(paint);
+                canvas.drawRect(rect, SURFACE_CLEAR_PAINT);
+                _rootElement.paint(new PaintState(canvas));
             } else {
                 Log.w(TAG, "paint lockCanvas returned null for rect=" + rect);
             }
@@ -975,52 +1007,85 @@ public final class ExecutionEnvironment extends Service
         }
     }
 
+    public void paintSurface(final SurfaceHolder holder) {
+        if (_rootElement == null) {
+            Log.w(TAG, "paint skip: rootElement=null");
+            return;
+        }
+        if (holder == null) {
+            Log.w(TAG, "paint skip: holder is null");
+            return;
+        }
+
+        Surface surface = holder.getSurface();
+        if (surface == null || !surface.isValid()) {
+            Log.w(TAG, "paint skip: surface invalid surface=" + surface);
+            return;
+        }
+
+        if (!paintHardware(surface))
+            paintSoftware(holder);
+    }
+
     public void paint() {
         synchronized (this) {
-            if (_paintScheduled || _executor == null || _executor.isShutdown() || _rootElement == null || _renderer == null || !_active)
+            if (_paintScheduled || _executor == null || _executor.isShutdown()
+                    || _rootElement == null || _renderer == null || !_active)
                 return;
             _paintScheduled = true;
         }
+        // Run on the same executor as key handling — never delay via Choreographer/main.
+        // Key-repeat must not outrun paint on the queue (that skips list items).
         _executor.execute(new SafeRunnable() {
             @Override
             public void doRun() {
-                synchronized (this) { _paintScheduled = false; }
-                ExecutionEnvironment.this.paint(_surfaceHolder);
+                synchronized (ExecutionEnvironment.this) {
+                    _paintScheduled = false;
+                }
+                ExecutionEnvironment.this.paintSurface(_surfaceHolder);
 
                 if (_elementUpdaters.isEmpty()) {
+                    synchronized (_updatedElements) {
+                        if (!_updatedElements.isEmpty())
+                            ExecutionEnvironment.this.paint();
+                    }
                     return;
                 }
-                Iterator<Map.Entry<Element, ElementUpdater>> it =_elementUpdaters.entrySet().iterator();
-                while(it.hasNext()) {
+
+                Iterator<Map.Entry<Element, ElementUpdater>> it = _elementUpdaters.entrySet().iterator();
+                while (it.hasNext()) {
                     Map.Entry<Element, ElementUpdater> entry = it.next();
                     if (!entry.getValue().tick())
                         it.remove();
                 }
 
-                for(Element el : _elementUpdatersStop) //avoid concurrent modification (element can call stopAnimation at any time
+                for (Element el : _elementUpdatersStop)
                     _elementUpdaters.remove(el);
                 _elementUpdatersStop.clear();
 
                 if (!_elementUpdaters.isEmpty())
-                    ExecutionEnvironment.this.paint(); //restart
+                    ExecutionEnvironment.this.paint();
             }
         });
     }
 
     private Rect popDirtyRect() {
         Element root = _rootElement;
-        if (root == null || _updatedElements.isEmpty() || _renderer == null)
+        if (root == null || _renderer == null)
             return null;
 
-        //Log.v(TAG, "popDirtyRect: " + _updatedElements.size() + " elements");
         final Rect clipRect = _surfaceGeometry;
         Rect combinedRect = new Rect();
-        for(Element el : _updatedElements) {
-            Rect elementRect = el.getRedrawRect(clipRect);
-            combinedRect.union(elementRect);
+        synchronized (_updatedElements) {
+            if (_updatedElements.isEmpty())
+                return null;
+            for (Element el : _updatedElements) {
+                Rect elementRect = el.getRedrawRect(clipRect);
+                combinedRect.union(elementRect);
+            }
+            _updatedElements.clear();
         }
-        _updatedElements.clear();
-        return !combinedRect.isEmpty()? combinedRect: null;
+        return !combinedRect.isEmpty() ? combinedRect : null;
     }
 
     public Future<Boolean> sendEvent(final String keyName, final KeyEvent event) {
