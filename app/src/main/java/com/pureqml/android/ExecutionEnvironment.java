@@ -507,9 +507,16 @@ public final class ExecutionEnvironment extends Service
         }
     }
     private final Map<String, ArrayList<TypefaceEntry>> typefaces = new HashMap<>();
+    /** CSS family name (e.g. RobotoBold) -> asset path; removed after first load */
+    private final Map<String, String> fontPaths = new HashMap<>();
 
     @Override
     public Typeface getTypeface(String fontFamily, int fontWeight, boolean italic) {
+        if (fontFamily != null && !typefaces.containsKey(fontFamily)) {
+            String path = fontPaths.remove(fontFamily);
+            if (path != null)
+                loadFont(path, fontFamily);
+        }
         ArrayList<TypefaceEntry> families = typefaces.get(fontFamily);
         if (families != null) {
             int pos = Collections.binarySearch(families, new TypefaceEntry(new Font(fontFamily, fontWeight, italic), null));
@@ -639,34 +646,49 @@ public final class ExecutionEnvironment extends Service
         _networkCallback = null;
     }
 
-    private void loadFont(String path) {
+    private static String cssFamilyFromPath(String path) {
+        // Match fonts.css / TextConsts names: Roboto-Bold.ttf -> RobotoBold
+        String fileName = path.substring(path.lastIndexOf('/') + 1);
+        int dot = fileName.lastIndexOf('.');
+        String baseName = dot > 0 ? fileName.substring(0, dot) : fileName;
+        return baseName.replace("-", "");
+    }
+
+    private void registerTypeface(Font fontFamily, Typeface tf) {
+        ArrayList<TypefaceEntry> list = typefaces.get(fontFamily.family);
+        if (list != null) {
+            list.add(new TypefaceEntry(fontFamily, tf));
+            Collections.sort(list);
+        } else {
+            list = new ArrayList<>();
+            list.add(new TypefaceEntry(fontFamily, tf));
+            typefaces.put(fontFamily.family, list);
+        }
+    }
+
+    private void loadFont(String path, String cssFamily) {
         Log.i(TAG, "loadFont " + path);
 
         try {
-            Font fontFamily = parseFontFamily(path);
             Typeface tf = Typeface.createFromAsset(getAssets(), path);
-            Log.v(TAG, "loaded " + fontFamily);
-            ArrayList<TypefaceEntry> list = typefaces.get(fontFamily.family);
-            if (list != null) {
-                list.add(new TypefaceEntry(fontFamily, tf));
-            } else {
-                list = new ArrayList<>();
-                list.add(new TypefaceEntry(fontFamily, tf));
-                typefaces.put(fontFamily.family, list);
-            }
+            registerTypeface(new Font(cssFamily, 400, false), tf);
+            Log.v(TAG, "loaded " + cssFamily);
         } catch (Exception e) {
             Log.w(TAG, "loading failed: " + path, e);
         }
     }
 
-    private void loadFonts(AssetManager am) {
+    private void indexFonts(AssetManager am) {
+        // Index paths only — Typeface is created on first getTypeface()
         Queue<String> to_visit = new LinkedList<>();
-        to_visit.add("");
+        to_visit.add("fonts");
         try {
             while(!to_visit.isEmpty()) {
                 String next = to_visit.remove();
-                if (next.endsWith(".ttf"))
-                    loadFont(next);
+                if (next.endsWith(".ttf")) {
+                    fontPaths.put(cssFamilyFromPath(next), next);
+                    continue;
+                }
                 String[] list = am.list(next);
                 if (list == null)
                     continue;
@@ -680,6 +702,7 @@ public final class ExecutionEnvironment extends Service
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+        Log.i(TAG, "indexed " + fontPaths.size() + " fonts");
     }
 
     private void start() {
@@ -693,13 +716,7 @@ public final class ExecutionEnvironment extends Service
         AssetManager am = getAssets();
 
         Log.v(TAG, "loading assets...");
-        // loadFonts(am);
-
-        for(ArrayList<TypefaceEntry> families : typefaces.values()) {
-            Collections.sort(families);
-            for(TypefaceEntry e: families)
-                Log.i(TAG, "font family " + e.family);
-        }
+        indexFonts(am);
 
         String script;
         final String assetName = "main.js";
