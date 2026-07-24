@@ -30,10 +30,23 @@ public final class ImageLoader {
     private final ExecutorService         _threadPool;
 
     private final HashMap<URI, CallbackHolder> _callbacks = new HashMap<>();
+    /*
+     * In-flight holders are kept outside the LRU. An unfinished holder has almost no
+     * cache weight, while its decoded Bitmap can already be large. Otherwise the LRU
+     * can evict an in-progress holder and a second request for the same URL can start
+     * another decode.
+     */
+    private final HashMap<URI, ImageHolder> _loading = new HashMap<>();
     private final LruCache<URI, ImageHolder> _cache = new LruCache<URI, ImageHolder>(CacheSize) {
         @Override
         protected int sizeOf(URI key, ImageHolder value) {
             return value.byteCount();
+        }
+
+        @Override
+        protected void entryRemoved(boolean evicted, URI key, ImageHolder oldValue, ImageHolder newValue) {
+            if (evicted && oldValue != null)
+                oldValue.release();
         }
     };
 
@@ -45,18 +58,26 @@ public final class ImageLoader {
     private ImageHolder getHolder(URI url) {
         synchronized (_cache) {
             ImageHolder holder = _cache.get(url);
-            if (holder == null) {
-                String stringUrl = url.toString();
-                String svgFileFormat = "svg";
-                if (stringUrl.contains(".") && svgFileFormat.equalsIgnoreCase(stringUrl.substring(stringUrl.lastIndexOf(".") + 1))) {
-                    holder = new ImageVectorHolder(url);
-                } else {
-                    holder = new ImageStaticHolder(url);
-                }
-                _cache.put(url, holder);
-                Log.v(TAG, "cache size: " + _cache.size());
-                _threadPool.execute(new ImageLoaderTask(url, holder));
+            if (holder != null)
+                return holder;
+        }
+
+        synchronized (_loading) {
+            ImageHolder holder = _loading.get(url);
+            if (holder != null)
+                return holder;
+
+            String stringUrl = url.toString();
+            String svgFileFormat = "svg";
+            if (stringUrl.contains(".") && svgFileFormat.equalsIgnoreCase(
+                    stringUrl.substring(stringUrl.lastIndexOf(".") + 1))) {
+                holder = new ImageVectorHolder(url);
+            } else {
+                holder = new ImageStaticHolder(url);
             }
+
+            _loading.put(url, holder);
+            _threadPool.execute(new ImageLoaderTask(url, holder));
             return holder;
         }
     }
@@ -78,6 +99,18 @@ public final class ImageLoader {
                 }
             }
         }
+        boolean isEmpty() {
+            synchronized (_callbacks) {
+                Iterator<WeakReference<ImageLoadedCallback>> it = _callbacks.iterator();
+                while (it.hasNext()) {
+                    if (it.next().get() != null)
+                        return false;
+                    it.remove();
+                }
+                return true;
+            }
+        }
+
         void onImageLoaded(URI uri, Bitmap bitmap) {
             LinkedList<ImageLoadedCallback> callbacks = new LinkedList<>();
             synchronized (_callbacks) {
@@ -127,8 +160,24 @@ public final class ImageLoader {
     }
     public void unsubscribe(URI url, ImageLoadedCallback callback) {
         CallbackHolder holder = getCallbackHolder(url);
-        if (holder != null)
+        if (holder != null) {
             holder.unsubscribe(callback);
+            if (holder.isEmpty()) {
+                synchronized (_callbacks) {
+                    if (_callbacks.get(url) == holder)
+                        _callbacks.remove(url);
+                }
+            }
+        }
+    }
+
+    /** Returns a cached bitmap without starting a new decode. */
+    @Nullable
+    public Bitmap peekBitmap(URI url) {
+        synchronized (_cache) {
+            ImageHolder holder = _cache.get(url);
+            return holder != null ? holder.getBitmap() : null;
+        }
     }
 
     public Bitmap getBitmap(URI url) {
@@ -178,13 +227,21 @@ public final class ImageLoader {
                 Log.e(TAG, "image loading failed", ex);
             } finally {
                 Bitmap bitmap;
+                _holder.finish();
+                bitmap = getNotifyBitmap();
+
+                synchronized (_loading) {
+                    if (_loading.get(_url) == _holder)
+                        _loading.remove(_url);
+                }
+
                 synchronized (_cache) {
-                    _cache.remove(_url);
-                    _holder.finish();
-                    bitmap = getNotifyBitmap();
                     _cache.put(_url, _holder);
                 }
-                getCallbackHolder(_url).onImageLoaded(_url, bitmap);
+
+                CallbackHolder callbacks = getCallbackHolder(_url);
+                if (callbacks != null)
+                    callbacks.onImageLoaded(_url, bitmap);
                 Log.v(TAG, "cache size: " + _cache.size());
             }
             Log.i(TAG, "finished loading task on " + _url);
@@ -198,6 +255,8 @@ public final class ImageLoader {
         int byteCount(); //LRUCache API
 
         void finish();
+
+        void release();
     }
 
     private static abstract class BaseImageHolder implements ImageHolder
@@ -223,7 +282,12 @@ public final class ImageLoader {
 
         @Override
         public synchronized int byteCount() {
-            return _url.toString().length() * 4 + (_finished && _image != null? _image.getByteCount(): 0);
+            return _image != null ? _image.getByteCount() : Math.max(_url.toString().length() * 4, 1);
+        }
+
+        @Override
+        public synchronized void release() {
+            _image = null;
         }
     }
 
@@ -258,6 +322,12 @@ public final class ImageLoader {
             } catch (SVGParseException e) {
                 Log.e(TAG, "loading vector image failed", e);
             }
+        }
+
+        @Override
+        public synchronized void release() {
+            _image = null;
+            _svg = null;
         }
 
         @Nullable
