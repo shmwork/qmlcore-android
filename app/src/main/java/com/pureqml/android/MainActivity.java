@@ -10,9 +10,11 @@ import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
+import android.graphics.drawable.ColorDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
@@ -28,6 +30,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
+import android.widget.ImageView;
 import android.view.inputmethod.InputMethodManager;
 
 import androidx.activity.OnBackPressedCallback;
@@ -47,6 +50,10 @@ public final class MainActivity
     private boolean                 _executionEnvironmentBound = false;
     private ExecutionEnvironment    _executionEnvironment;
     private SurfaceView             _mainView;
+    private ImageView               _softwareUiOverlay;
+    private boolean                 _softwareOverlayWanted;
+    private boolean                 _softwareOverlayInWindow;
+    private boolean                 _uiSurfaceParked;
     private Rect                    _surfaceFrame;
     private IRenderer               _uiRenderer;
     boolean                         _keyDownHandled;
@@ -191,6 +198,16 @@ public final class MainActivity
                     public void moveTaskToBack() {
                         MainActivity.this.moveTaskToBack(true);
                     }
+
+                    @Override
+                    public void setSoftwareUiOverlayEnabled(boolean enabled) {
+                        MainActivity.this.setSoftwareUiOverlayEnabled(enabled);
+                    }
+
+                    @Override
+                    public void presentSoftwareUiOverlay(Bitmap bitmap) {
+                        MainActivity.this.presentSoftwareUiOverlay(bitmap);
+                    }
                 };
                 _isSurfaceReady = true;
                 _surfaceFrame = holder.getSurfaceFrame();
@@ -225,6 +242,13 @@ public final class MainActivity
         public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
             Log.i(TAG, "surface destroyed");
             synchronized (MainActivity.this) {
+                if (_softwareOverlayWanted || _uiSurfaceParked) {
+                    Log.i(TAG, "keeping renderer: UI surface destroyed during software overlay");
+                    if (_executionEnvironment != null)
+                        _executionEnvironment.setSurfaceHolder(null);
+                    _surfaceFrame = null;
+                    return;
+                }
                 if (_executionEnvironment != null) {
                     _executionEnvironment.setRenderer(null);
                     _executionEnvironment.setSurfaceHolder(null);
@@ -251,6 +275,15 @@ public final class MainActivity
                 bar.hide();
         }
         setContentView(R.layout.activity_main);
+        getWindow().setBackgroundDrawable(new ColorDrawable(Color.BLACK));
+        View content = findViewById(android.R.id.content);
+        if (content != null)
+            content.setBackgroundColor(Color.BLACK);
+
+        _softwareUiOverlay = new ImageView(this);
+        _softwareUiOverlay.setVisibility(View.GONE);
+        _softwareUiOverlay.setScaleType(ImageView.ScaleType.FIT_XY);
+        _softwareUiOverlay.setBackgroundColor(Color.TRANSPARENT);
 
         _imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
 
@@ -363,6 +396,99 @@ public final class MainActivity
         return super.dispatchKeyEvent(event);
     }
 
+    private void setSoftwareUiOverlayEnabled(boolean enabled) {
+        runOnUiThread(() -> {
+            _softwareOverlayWanted = enabled;
+            if (!enabled)
+                hideSoftwareUiOverlay();
+        });
+    }
+
+    private void presentSoftwareUiOverlay(final Bitmap bitmap) {
+        runOnUiThread(() -> {
+            if (!_softwareOverlayWanted || _softwareUiOverlay == null
+                    || bitmap == null || bitmap.isRecycled())
+                return;
+            attachSoftwareUiOverlay();
+            _softwareUiOverlay.setImageBitmap(bitmap);
+            _softwareUiOverlay.setVisibility(View.VISIBLE);
+            parkUiSurface();
+        });
+    }
+
+    private void hideSoftwareUiOverlay() {
+        unparkUiSurface();
+        if (_softwareUiOverlay == null)
+            return;
+        _softwareUiOverlay.setImageBitmap(null);
+        _softwareUiOverlay.setVisibility(View.GONE);
+        detachSoftwareUiOverlay();
+    }
+
+    private void parkUiSurface() {
+        if (_uiSurfaceParked || _mainView == null)
+            return;
+        float dx = _mainView.getWidth();
+        if (dx <= 0)
+            dx = 4096f;
+        _mainView.setTranslationX(dx);
+        _uiSurfaceParked = true;
+    }
+
+    private void unparkUiSurface() {
+        if (!_uiSurfaceParked)
+            return;
+        if (_mainView != null)
+            _mainView.setTranslationX(0);
+        _uiSurfaceParked = false;
+    }
+
+    private void attachSoftwareUiOverlay() {
+        if (_softwareUiOverlay.getParent() != null)
+            return;
+        android.os.IBinder token = getWindow().getDecorView().getWindowToken();
+        if (token != null) {
+            WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                            | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    PixelFormat.TRANSLUCENT);
+            lp.token = token;
+            lp.setTitle("software-ui-overlay");
+            try {
+                getWindowManager().addView(_softwareUiOverlay, lp);
+                _softwareOverlayInWindow = true;
+                return;
+            } catch (RuntimeException e) {
+                Log.w(TAG, "software UI overlay window failed", e);
+            }
+        }
+        ViewGroup content = findViewById(android.R.id.content);
+        if (content == null)
+            return;
+        content.addView(_softwareUiOverlay, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        _softwareOverlayInWindow = false;
+    }
+
+    private void detachSoftwareUiOverlay() {
+        if (_softwareUiOverlay == null || _softwareUiOverlay.getParent() == null)
+            return;
+        if (_softwareOverlayInWindow) {
+            try {
+                getWindowManager().removeViewImmediate(_softwareUiOverlay);
+            } catch (RuntimeException e) {
+                Log.w(TAG, "remove overlay window", e);
+            }
+        } else if (_softwareUiOverlay.getParent() instanceof ViewGroup) {
+            ((ViewGroup) _softwareUiOverlay.getParent()).removeView(_softwareUiOverlay);
+        }
+        _softwareOverlayInWindow = false;
+    }
+
     private boolean handleBackPress() {
         long now = SystemClock.uptimeMillis();
         if (_lastBackUptimeMs != 0 && now - _lastBackUptimeMs < BACK_DEBOUNCE_MS) {
@@ -458,6 +584,7 @@ public final class MainActivity
     @Override
     protected void onDestroy() {
         Log.i(TAG, "onDestroy");
+        hideSoftwareUiOverlay();
         if (_executionEnvironmentBound)
             unbindService(_executionEnvironmentConnection);
         _mainView = null;

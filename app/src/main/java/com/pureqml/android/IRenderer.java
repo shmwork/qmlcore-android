@@ -1,5 +1,6 @@
 package com.pureqml.android;
 
+import android.graphics.Bitmap;
 import android.graphics.Rect;
 import android.util.DisplayMetrics;
 
@@ -12,4 +13,6 @@ public interface IRenderer {
     void closeApp();
 	void moveTaskToBack();
     String getIntentParam(String text);
+    void setSoftwareUiOverlayEnabled(boolean enabled);
+    void presentSoftwareUiOverlay(Bitmap bitmap);
 }
