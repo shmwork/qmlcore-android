@@ -16,6 +16,7 @@ import android.graphics.Rect;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.KeyEvent;
@@ -53,6 +54,10 @@ public final class MainActivity
     InputMethodManager              _imm;
     private boolean _isResumed = false;
     private boolean _isSurfaceReady = false;
+    // One physical Back may arrive via KeyEvent and OnBackPressedCallback; keep a single gated handler.
+    private static final long BACK_DEBOUNCE_MS = 100;
+    private long _lastBackUptimeMs;
+    private boolean _lastBackResult;
 
     private final ServiceConnection _executionEnvironmentConnection = new ServiceConnection() {
         public void onServiceConnected(ComponentName className, IBinder service) {
@@ -281,7 +286,7 @@ public final class MainActivity
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
-                if (!processBack())
+                if (!handleBackPress())
                     finish();
             }
         });
@@ -327,6 +332,8 @@ public final class MainActivity
                     _keyDownHandled = true;
                     _showSoftKeyboard = true;
                     _executionEnvironment.blockUiInput(true);
+                } else if ("Back".equals(keyName)) {
+                    _keyDownHandled = handleBackPress();
                 } else if (_executionEnvironment != null) {
                     try {
                         _keyDownHandled = _executionEnvironment.sendEvent(keyName, event).get();
@@ -356,8 +363,22 @@ public final class MainActivity
         return super.dispatchKeyEvent(event);
     }
 
+    private boolean handleBackPress() {
+        long now = SystemClock.uptimeMillis();
+        if (_lastBackUptimeMs != 0 && now - _lastBackUptimeMs < BACK_DEBOUNCE_MS) {
+            Log.d(TAG, "duplicate back ignored, result=" + _lastBackResult);
+            return _lastBackResult;
+        }
+        _lastBackUptimeMs = now;
+        _lastBackResult = processBack();
+        return _lastBackResult;
+    }
+
     private boolean processBack() {
         try {
+            if (_executionEnvironment == null)
+                return false;
+
             ExecutorService executor = _executionEnvironment.getExecutor();
             if (executor == null)
                 return false;
