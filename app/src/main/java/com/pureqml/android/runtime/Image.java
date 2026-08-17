@@ -389,10 +389,19 @@ public final class Image extends Element implements ImageLoadedCallback {
 
             if (doPaint) {
                 Rect src = new Rect(0, 0, bitmap.getWidth(), bitmap.getHeight());
-                // Default Absolute size is 0 until QML applies background-size. Drawing
-                // stretched avoids a black frame when the bitmap is already available.
                 if (_backgroundX.mode == Mode.Absolute && _backgroundX.size == 0
                         && _backgroundY.mode == Mode.Absolute && _backgroundY.size == 0) {
+                    float wx = 1.0f * dst.width() / src.width();
+                    float hx = 1.0f * dst.height() / src.height();
+                    float x = Math.max(wx, hx);
+                    int scaledWidth = Math.round(src.width() * x);
+                    int scaledHeight = Math.round(src.height() * x);
+                    int dx = dst.width() - scaledWidth;
+                    int dy = dst.height() - scaledHeight;
+                    dst.left += dx / 2;
+                    dst.top += dy / 2;
+                    dst.right = dst.left + scaledWidth;
+                    dst.bottom = dst.top + scaledHeight;
                     state.drawBitmap(bitmap, src, dst, paint);
                 } else {
                     _backgroundX.merge(_backgroundY, dst, src);
