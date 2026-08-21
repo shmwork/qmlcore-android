@@ -5,6 +5,8 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
+import android.graphics.RectF;
+import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -15,6 +17,7 @@ import android.util.TypedValue;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.view.accessibility.CaptioningManager;
 
 import androidx.annotation.Nullable;
 import androidx.annotation.OptIn;
@@ -66,6 +69,9 @@ import com.pureqml.android.TypeConverter;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 
@@ -253,15 +259,115 @@ public final class VideoPlayer extends BaseObject implements IResource {
     private int                         hlsExtractorFlags = 0;
     private boolean                     exposeCea608WhenMissingDeclarations = true;
     private final static float          defaultTextSizeSP = 22;
+    private static final float          captionInnerPaddingRatio = 0.125f;
+    private static final float          captionOutlineRatio = 0.08f;
+
+    private static final class ResolvedCaptionStyle {
+        final float fontScale;
+        final int foregroundColor;
+        final int backgroundColor;
+        final int windowColor;
+        final int edgeType;
+        final int edgeColor;
+        final Typeface typeface;
+
+        ResolvedCaptionStyle(float fontScale, int foregroundColor, int backgroundColor,
+                             int windowColor, int edgeType, int edgeColor, Typeface typeface) {
+            this.fontScale = fontScale;
+            this.foregroundColor = foregroundColor;
+            this.backgroundColor = backgroundColor;
+            this.windowColor = windowColor;
+            this.edgeType = edgeType;
+            this.edgeColor = edgeColor;
+            this.typeface = typeface;
+        }
+
+        static ResolvedCaptionStyle fallback() {
+            return new ResolvedCaptionStyle(
+                    1f,
+                    Color.WHITE,
+                    Color.TRANSPARENT,
+                    Color.TRANSPARENT,
+                    CaptioningManager.CaptionStyle.EDGE_TYPE_OUTLINE,
+                    Color.BLACK,
+                    null);
+        }
+
+        static ResolvedCaptionStyle from(@Nullable CaptioningManager manager) {
+            if (manager == null)
+                return fallback();
+
+            CaptioningManager.CaptionStyle style = manager.getUserStyle();
+            float fontScale = Math.max(0.25f, manager.getFontScale());
+            int foreground = Color.WHITE;
+            int background = Color.BLACK;
+            int window = Color.TRANSPARENT;
+            int edgeType = CaptioningManager.CaptionStyle.EDGE_TYPE_NONE;
+            int edgeColor = Color.BLACK;
+            Typeface typeface = null;
+            if (style != null) {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP || style.hasForegroundColor())
+                    foreground = style.foregroundColor;
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP || style.hasBackgroundColor())
+                    background = style.backgroundColor;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && style.hasWindowColor())
+                    window = style.windowColor;
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP || style.hasEdgeType())
+                    edgeType = style.edgeType;
+                if (edgeType == CaptioningManager.CaptionStyle.EDGE_TYPE_UNSPECIFIED)
+                    edgeType = CaptioningManager.CaptionStyle.EDGE_TYPE_NONE;
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP || style.hasEdgeColor())
+                    edgeColor = style.edgeColor;
+                typeface = style.getTypeface();
+            }
+            return new ResolvedCaptionStyle(fontScale, foreground, background, window, edgeType, edgeColor, typeface);
+        }
+    }
 
     private static class PaintDelegate implements Element.PaintDelegate {
         final Context context;
         final Element ui;
+        final CaptioningManager captioningManager;
+        final CaptioningManager.CaptioningChangeListener captioningListener;
         CueGroup cueGroup;
 
         PaintDelegate(Context context, Element ui) {
             this.context = context;
             this.ui = ui;
+            this.captioningManager = (CaptioningManager) context.getSystemService(Context.CAPTIONING_SERVICE);
+            this.captioningListener = new CaptioningManager.CaptioningChangeListener() {
+                @Override
+                public void onEnabledChanged(boolean enabled) {
+                    refresh();
+                }
+
+                @Override
+                public void onUserStyleChanged(@NonNull CaptioningManager.CaptionStyle userStyle) {
+                    refresh();
+                }
+
+                @Override
+                public void onFontScaleChanged(float fontScale) {
+                    refresh();
+                }
+
+                @Override
+                public void onLocaleChanged(@Nullable Locale locale) {
+                    refresh();
+                }
+            };
+            if (captioningManager != null)
+                captioningManager.addCaptioningChangeListener(captioningListener);
+        }
+
+        void release() {
+            if (captioningManager != null)
+                captioningManager.removeCaptioningChangeListener(captioningListener);
+        }
+
+        void refresh() {
+            Log.d(TAG, "caption style changed");
+            ui.update();
         }
 
         @Override
@@ -269,11 +375,19 @@ public final class VideoPlayer extends BaseObject implements IResource {
             if (cueGroup == null || cueGroup.cues.isEmpty())
                 return;
             Rect rect = ui.getRect();
+            ResolvedCaptionStyle style = ResolvedCaptionStyle.from(captioningManager);
             float textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP,
-                    defaultTextSizeSP, context.getResources().getDisplayMetrics());
+                    defaultTextSizeSP, context.getResources().getDisplayMetrics()) * style.fontScale;
             float lineHeight = textSize * ComputedStyle.DefaultLineHeight;
+            float padding = textSize * captionInnerPaddingRatio;
+            float outlineWidth = Math.max(2f, textSize * captionOutlineRatio);
             TextPaint paint = new TextPaint(Paint.ANTI_ALIAS_FLAG | Paint.LINEAR_TEXT_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
             paint.setTextSize(textSize);
+            if (style.typeface != null)
+                paint.setTypeface(style.typeface);
+            Paint boxPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+            boxPaint.setStyle(Paint.Style.FILL);
+            Paint.FontMetrics fm = paint.getFontMetrics();
             for(Cue cue : cueGroup.cues) {
                 if (cue.text == null && cue.bitmap == null)
                     continue;
@@ -340,6 +454,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
                 float y = linePos;
 
                 if (cue.text != null) {
+                    paint.setTextAlign(Paint.Align.LEFT);
                     if (cue.textAlignment != null) {
                         switch (cue.textAlignment) {
                             case ALIGN_NORMAL:
@@ -354,16 +469,35 @@ public final class VideoPlayer extends BaseObject implements IResource {
                                 break;
                         }
                     }
+                    Paint.Align align = paint.getTextAlign();
+                    if (Color.alpha(style.windowColor) != 0 && text.length > 0) {
+                        RectF window = null;
+                        float windowY = y;
+                        for (String line : text) {
+                            RectF bounds = lineBounds(x, windowY, paint.measureText(line), align, fm, padding);
+                            if (window == null)
+                                window = bounds;
+                            else
+                                window.union(bounds);
+                            windowY += lineHeight;
+                        }
+                        if (window != null) {
+                            boxPaint.setColor(style.windowColor);
+                            state.drawRect(window, boxPaint);
+                        }
+                    }
                     for(String line : text) {
-                        paint.setStyle(Paint.Style.STROKE);
-                        paint.setColor(Color.BLACK);
-                        state.drawText(line, x, y, paint);
-                        paint.setStyle(Paint.Style.FILL);
-                        paint.setColor(Color.WHITE);
-                        state.drawText(line, x, y, paint);
+                        if (Color.alpha(style.backgroundColor) != 0) {
+                            RectF bounds = lineBounds(x, y, paint.measureText(line), align, fm, padding);
+                            boxPaint.setColor(style.backgroundColor);
+                            state.drawRect(bounds, boxPaint);
+                        }
+                        drawStyledText(state, line, x, y, paint, style, outlineWidth);
                         y += lineHeight;
                     }
                 } else {
+                    paint.setStyle(Paint.Style.FILL);
+                    paint.clearShadowLayer();
                     Rect dstRect = new Rect((int)x, (int)y, (int)(x + cue.bitmap.getWidth()), (int)(y + cue.bitmap.getHeight()));
                     state.drawBitmap(cue.bitmap, null, dstRect, paint);
                 }
@@ -374,6 +508,80 @@ public final class VideoPlayer extends BaseObject implements IResource {
             Log.v(TAG, "onCues " + cueGroup.cues.size());
             this.cueGroup = cueGroup;
             ui.update();
+        }
+
+        private static RectF lineBounds(float x, float y, float width, Paint.Align align,
+                                        Paint.FontMetrics fm, float padding) {
+            float left;
+            switch (align) {
+                case RIGHT:
+                    left = x - width;
+                    break;
+                case CENTER:
+                    left = x - width / 2.0f;
+                    break;
+                case LEFT:
+                default:
+                    left = x;
+                    break;
+            }
+            return new RectF(
+                    left - padding,
+                    y + fm.ascent - padding,
+                    left + width + padding,
+                    y + fm.descent + padding);
+        }
+
+        private static void drawStyledText(PaintState state, String line, float x, float y,
+                                           TextPaint paint, ResolvedCaptionStyle style, float outlineWidth) {
+            paint.clearShadowLayer();
+            paint.setStrokeWidth(0);
+            switch (style.edgeType) {
+                case CaptioningManager.CaptionStyle.EDGE_TYPE_OUTLINE:
+                    paint.setStrokeJoin(Paint.Join.ROUND);
+                    paint.setStrokeCap(Paint.Cap.ROUND);
+                    paint.setStrokeWidth(outlineWidth);
+                    paint.setColor(style.edgeColor);
+                    paint.setStyle(Paint.Style.FILL_AND_STROKE);
+                    state.drawText(line, x, y, paint);
+                    paint.setStrokeWidth(0);
+                    paint.setStyle(Paint.Style.FILL);
+                    paint.setColor(style.foregroundColor);
+                    state.drawText(line, x, y, paint);
+                    break;
+                case CaptioningManager.CaptionStyle.EDGE_TYPE_DROP_SHADOW:
+                    paint.setStyle(Paint.Style.FILL);
+                    paint.setColor(style.foregroundColor);
+                    paint.setShadowLayer(outlineWidth, outlineWidth, outlineWidth, style.edgeColor);
+                    state.drawText(line, x, y, paint);
+                    paint.clearShadowLayer();
+                    break;
+                case CaptioningManager.CaptionStyle.EDGE_TYPE_RAISED:
+                case CaptioningManager.CaptionStyle.EDGE_TYPE_DEPRESSED: {
+                    boolean raised = style.edgeType == CaptioningManager.CaptionStyle.EDGE_TYPE_RAISED;
+                    int colorUp = raised ? Color.WHITE : style.edgeColor;
+                    int colorDown = raised ? style.edgeColor : Color.WHITE;
+                    float offset = outlineWidth / 2.0f;
+                    paint.setStyle(Paint.Style.FILL);
+                    paint.setColor(style.foregroundColor);
+                    paint.setShadowLayer(outlineWidth, -offset, -offset, colorUp);
+                    state.drawText(line, x, y, paint);
+                    paint.setShadowLayer(outlineWidth, offset, offset, colorDown);
+                    state.drawText(line, x, y, paint);
+                    paint.clearShadowLayer();
+                    state.drawText(line, x, y, paint);
+                    break;
+                }
+                case CaptioningManager.CaptionStyle.EDGE_TYPE_NONE:
+                default:
+                    paint.setStyle(Paint.Style.FILL);
+                    paint.setColor(style.foregroundColor);
+                    state.drawText(line, x, y, paint);
+                    break;
+            }
+            paint.setStrokeWidth(0);
+            paint.setStyle(Paint.Style.FILL);
+            paint.clearShadowLayer();
         }
     }
     PaintDelegate                       paintDelegate;
@@ -955,6 +1163,10 @@ public final class VideoPlayer extends BaseObject implements IResource {
     @Override
     public void discard() {
         super.discard();
+        if (paintDelegate != null) {
+            paintDelegate.release();
+            paintDelegate = null;
+        }
         viewHolder.discard(_env.getRootView());
         releaseResource();
     }
