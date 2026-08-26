@@ -9,6 +9,7 @@ import android.content.pm.FeatureInfo;
 import android.content.pm.PackageManager;
 import android.content.res.AssetManager;
 import android.content.res.Configuration;
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
@@ -18,6 +19,7 @@ import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.os.Binder;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -155,6 +157,19 @@ public final class ExecutionEnvironment extends Service
     private ConnectivityManager         _connectivityManager;
     private Boolean                     _networkStatus;
     private volatile boolean            _active = true;
+    private final Handler               _mainHandler = new Handler(Looper.getMainLooper());
+    private final Object                _uiFrameLock = new Object();
+    private Bitmap                      _uiPaintBitmap;
+    private Bitmap                      _uiPendingBitmap;
+    private Bitmap                      _uiShownBitmap;
+    private boolean                     _pendingOverlayValid;
+    private boolean                     _overlayPresentQueued;
+    private boolean                     _softwareOverlayEnabled;
+    private int                         _blitEpoch;
+    private boolean                     _overlayPaintUrgent;
+    private boolean                     _overlayThrottlePosted;
+    private boolean                     _suppressPaintChain;
+    private long                        _lastOverlayPaintUptime;
 
     public ExecutionEnvironment() {
         super();
@@ -307,6 +322,9 @@ public final class ExecutionEnvironment extends Service
                     _keepScreenOn = TypeConverter.toBoolean(v8Array.get(1));
                     if (_renderer != null)
                         _renderer.keepScreenOn(_keepScreenOn);
+                    break;
+                case "software-decoder":
+                    VideoPlayer.setSoftwareDecoder(TypeConverter.toBoolean(v8Array.get(1)));
                     break;
                 default:
                     Log.w(TAG, "skipping device feature " + v8Array);
@@ -810,6 +828,9 @@ public final class ExecutionEnvironment extends Service
 
         _executor = null;
         _objects.clear();
+        synchronized (_uiFrameLock) {
+            recycleOffscreenBitmapsLocked();
+        }
     }
 
     @Override
@@ -899,6 +920,12 @@ public final class ExecutionEnvironment extends Service
     }
 
     @Override
+    public void requestRepaint() {
+        if (_rootElement != null)
+            update(_rootElement);
+    }
+
+    @Override
     public void startAnimation(Element el, float seconds)
     { _elementUpdaters.put(el, new ElementUpdater(el, seconds)); }
 
@@ -924,6 +951,195 @@ public final class ExecutionEnvironment extends Service
     private static final Paint SURFACE_CLEAR_PAINT = new Paint();
     static {
         SURFACE_CLEAR_PAINT.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.CLEAR));
+    }
+
+    private void ensureOffscreenBitmapsLocked(int w, int h) {
+        if (_uiPaintBitmap != null && _uiPaintBitmap.getWidth() == w && _uiPaintBitmap.getHeight() == h)
+            return;
+        recycleOffscreenBitmapsLocked();
+        _uiPaintBitmap = createOverlayBitmap(w, h);
+        _uiPendingBitmap = createOverlayBitmap(w, h);
+        _uiShownBitmap = createOverlayBitmap(w, h);
+        _pendingOverlayValid = false;
+    }
+
+    private static Bitmap createOverlayBitmap(int w, int h) {
+        Bitmap bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        bitmap.setHasAlpha(true);
+        return bitmap;
+    }
+
+    private void recycleOffscreenBitmapsLocked() {
+        if (_uiPaintBitmap != null) {
+            _uiPaintBitmap.recycle();
+            _uiPaintBitmap = null;
+        }
+        if (_uiPendingBitmap != null) {
+            _uiPendingBitmap.recycle();
+            _uiPendingBitmap = null;
+        }
+        if (_uiShownBitmap != null) {
+            _uiShownBitmap.recycle();
+            _uiShownBitmap = null;
+        }
+        _pendingOverlayValid = false;
+        _overlayPresentQueued = false;
+    }
+
+    private void disableSoftwareUiOverlay() {
+        if (!_softwareOverlayEnabled)
+            return;
+        _softwareOverlayEnabled = false;
+        synchronized (_uiFrameLock) {
+            _blitEpoch++;
+            _pendingOverlayValid = false;
+            _overlayPresentQueued = false;
+        }
+        final IRenderer renderer = getRenderer();
+        _mainHandler.post(new SafeRunnable() {
+            @Override
+            protected void doRun() {
+                if (renderer != null)
+                    renderer.setSoftwareUiOverlayEnabled(false);
+                ExecutorService executor = _executor;
+                if (executor == null || executor.isShutdown())
+                    return;
+                executor.execute(new SafeRunnable() {
+                    @Override
+                    protected void doRun() {
+                        synchronized (_uiFrameLock) {
+                            recycleOffscreenBitmapsLocked();
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    private static final int OVERLAY_MIN_INTERVAL_MS = 48;
+
+    /**
+     * Software decoder on Meson outputs YV12. HWC cannot overlay it, GLES converts every
+     * frame, and lockHardwareCanvas() on the JS executor then blocks keys for seconds (ANR).
+     * Rasterize QML to CPU bitmaps and present via ImageView instead of locking the UI SurfaceView.
+     */
+    private boolean paintSoftwareDecoderOverlay() {
+        if (_surfaceGeometry == null || _surfaceGeometry.isEmpty())
+            return false;
+
+        long now = SystemClock.uptimeMillis();
+        if (_softwareOverlayEnabled && !_overlayPaintUrgent
+                && now - _lastOverlayPaintUptime < OVERLAY_MIN_INTERVAL_MS) {
+            if (!_overlayThrottlePosted) {
+                _overlayThrottlePosted = true;
+                long delay = OVERLAY_MIN_INTERVAL_MS - (now - _lastOverlayPaintUptime);
+                _mainHandler.postDelayed(new SafeRunnable() {
+                    @Override
+                    protected void doRun() {
+                        _overlayThrottlePosted = false;
+                        ExecutorService executor = _executor;
+                        if (executor == null || executor.isShutdown())
+                            return;
+                        executor.execute(new SafeRunnable() {
+                            @Override
+                            protected void doRun() {
+                                if (_rootElement != null)
+                                    update(_rootElement);
+                            }
+                        });
+                    }
+                }, delay);
+            }
+            _suppressPaintChain = true;
+            return true;
+        }
+        _overlayPaintUrgent = false;
+        _lastOverlayPaintUptime = now;
+
+        synchronized (_updatedElements) {
+            if (_updatedElements.isEmpty() && _softwareOverlayEnabled)
+                return true;
+            _updatedElements.clear();
+        }
+
+        final int w = _surfaceGeometry.width();
+        final int h = _surfaceGeometry.height();
+        Bitmap paint;
+        synchronized (_uiFrameLock) {
+            ensureOffscreenBitmapsLocked(w, h);
+            paint = _uiPaintBitmap;
+        }
+        if (paint == null || paint.isRecycled())
+            return false;
+
+        paint.eraseColor(Color.TRANSPARENT);
+        Canvas canvas = new Canvas(paint);
+        _rootElement.paint(new PaintState(canvas));
+
+        boolean queuePresent;
+        synchronized (_uiFrameLock) {
+            Bitmap tmp = _uiPaintBitmap;
+            _uiPaintBitmap = _uiPendingBitmap;
+            _uiPendingBitmap = tmp;
+            _pendingOverlayValid = true;
+            queuePresent = !_overlayPresentQueued;
+            if (queuePresent)
+                _overlayPresentQueued = true;
+        }
+
+        if (!_softwareOverlayEnabled) {
+            _softwareOverlayEnabled = true;
+            Log.i(TAG, "software-decoder UI: offscreen bitmap, skip lockHardwareCanvas");
+            final IRenderer renderer = getRenderer();
+            _mainHandler.post(new SafeRunnable() {
+                @Override
+                protected void doRun() {
+                    if (renderer != null)
+                        renderer.setSoftwareUiOverlayEnabled(true);
+                }
+            });
+        }
+
+        if (queuePresent) {
+            final int epoch = _blitEpoch;
+            _mainHandler.post(new SafeRunnable() {
+                @Override
+                protected void doRun() {
+                    presentOverlayLoop(epoch);
+                }
+            });
+        }
+        return true;
+    }
+
+    private void presentOverlayLoop(final int epoch) {
+        final Bitmap shown;
+        synchronized (_uiFrameLock) {
+            if (epoch != _blitEpoch || !_pendingOverlayValid) {
+                _overlayPresentQueued = false;
+                return;
+            }
+            Bitmap tmp = _uiShownBitmap;
+            _uiShownBitmap = _uiPendingBitmap;
+            _uiPendingBitmap = tmp;
+            _pendingOverlayValid = false;
+            shown = _uiShownBitmap;
+        }
+        IRenderer renderer = getRenderer();
+        if (renderer != null && shown != null && !shown.isRecycled())
+            renderer.presentSoftwareUiOverlay(shown);
+        synchronized (_uiFrameLock) {
+            if (_pendingOverlayValid && epoch == _blitEpoch) {
+                _mainHandler.post(new SafeRunnable() {
+                    @Override
+                    protected void doRun() {
+                        presentOverlayLoop(epoch);
+                    }
+                });
+            } else {
+                _overlayPresentQueued = false;
+            }
+        }
     }
 
     /**
@@ -1012,6 +1228,22 @@ public final class ExecutionEnvironment extends Service
             Log.w(TAG, "paint skip: rootElement=null");
             return;
         }
+
+        if (VideoPlayer.isSoftwareDecoderRendering()) {
+            paintSoftwareDecoderOverlay();
+            return;
+        }
+
+        if (_softwareOverlayEnabled) {
+            Surface surface = holder != null ? holder.getSurface() : null;
+            if (surface != null && surface.isValid()) {
+                if (!paintHardware(surface))
+                    paintSoftware(holder);
+            }
+            disableSoftwareUiOverlay();
+            return;
+        }
+
         if (holder == null) {
             Log.w(TAG, "paint skip: holder is null");
             return;
@@ -1043,6 +1275,11 @@ public final class ExecutionEnvironment extends Service
                     _paintScheduled = false;
                 }
                 ExecutionEnvironment.this.paintSurface(_surfaceHolder);
+
+                if (_suppressPaintChain) {
+                    _suppressPaintChain = false;
+                    return;
+                }
 
                 if (_elementUpdaters.isEmpty()) {
                     synchronized (_updatedElements) {
@@ -1091,6 +1328,7 @@ public final class ExecutionEnvironment extends Service
     public Future<Boolean> sendEvent(final String keyName, final KeyEvent event) {
         return _executor.submit(() -> {
             try {
+                _overlayPaintUrgent = true;
                 boolean r = _rootElement != null && _rootElement.sendEvent(keyName, event);
                 Log.v(TAG, "key processed = " + r);
                 return r;

@@ -6,6 +6,7 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
@@ -38,8 +39,10 @@ import androidx.media3.exoplayer.DefaultLoadControl;
 import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.Renderer;
+import androidx.media3.exoplayer.audio.AudioSink;
 import androidx.media3.exoplayer.hls.DefaultHlsExtractorFactory;
 import androidx.media3.exoplayer.hls.HlsMediaSource;
+import androidx.media3.exoplayer.mediacodec.MediaCodecSelector;
 import androidx.media3.exoplayer.source.BaseMediaSource;
 import androidx.media3.exoplayer.source.BehindLiveWindowException;
 import androidx.media3.exoplayer.source.LoadEventInfo;
@@ -47,7 +50,6 @@ import androidx.media3.exoplayer.source.MediaLoadData;
 import androidx.media3.exoplayer.source.MediaSource;
 import androidx.media3.exoplayer.source.MediaSourceEventListener;
 import androidx.media3.exoplayer.source.ProgressiveMediaSource;
-import androidx.media3.exoplayer.text.SubtitleDecoderFactory;
 import androidx.media3.exoplayer.text.TextOutput;
 import androidx.media3.exoplayer.text.TextRenderer;
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector;
@@ -64,8 +66,11 @@ import com.pureqml.android.SafeRunnable;
 import com.pureqml.android.TypeConverter;
 
 import java.io.IOException;
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 
@@ -229,10 +234,18 @@ public final class VideoPlayer extends BaseObject implements IResource {
 
     private static final String TAG = "VideoPlayer";
     private static final int PollingInterval = 500; //ms
+    private static final Object INSTANCES_LOCK = new Object();
+    private static final List<WeakReference<VideoPlayer>> INSTANCES = new ArrayList<>();
+    private static volatile boolean preferSoftwareDecoder = false;
+    private static volatile boolean softwareOutputActive = false;
+    private static final boolean NEEDS_SOFTWARE_UI_OVERLAY = deviceNeedsSoftwareUiOverlay();
+    private volatile boolean usingSoftwareDecoder = false;
+    private volatile boolean recreatingPlayer = false;
 
     private ExoPlayer player;
     private final SurfaceView           surfaceView;
     private final ViewHolder<?>         viewHolder;
+    private final HandlerThread         playerThread;
     private final Handler               handler;
     private final Timeline.Period       period;
 
@@ -241,13 +254,18 @@ public final class VideoPlayer extends BaseObject implements IResource {
     private int                         videoWidth = 0;
     private int                         videoHeight = 0;
     private String                      source;
-    private boolean                     playerVisible = true;
+    private volatile boolean            playerVisible = true;
     private boolean                     autoplay = false;
     private boolean                     paused = false;
-    private boolean                     stopped = false;
+    private volatile boolean            stopped = false;
     private Runnable                    pollingTask = null;
+    private int                         pollingGeneration = 0;
 
     private Tracks                      tracks = null;
+    private long                        lastEmittedDurationMs = TIME_UNSET;
+    private boolean                     audioDisabledDueToTrackLimit = false;
+    private int                         audioRecoverAttempts = 0;
+    private boolean                     recoveringAudio = false;
 
     //exoplayer flags
     private int                         hlsExtractorFlags = 0;
@@ -386,9 +404,9 @@ public final class VideoPlayer extends BaseObject implements IResource {
             ui.setPaintDelegate(paintDelegate);
         }
 
-        HandlerThread thread = new HandlerThread(this.toString());
-        thread.start();
-        handler = new Handler(thread.getLooper());
+        playerThread = new HandlerThread("VideoPlayer");
+        playerThread.start();
+        handler = new Handler(playerThread.getLooper());
 
         Context context = env.getContext();
         surfaceView = new SurfaceView(context);
@@ -397,8 +415,265 @@ public final class VideoPlayer extends BaseObject implements IResource {
         period = new Timeline.Period();
 
         _env.register(this);
+        synchronized (INSTANCES_LOCK) {
+            INSTANCES.add(new WeakReference<>(this));
+        }
 
         acquireResource();
+    }
+
+    public static void setSoftwareDecoder(boolean enable) {
+        Log.i(TAG, "setSoftwareDecoder " + enable);
+        if (preferSoftwareDecoder == enable)
+            return;
+        preferSoftwareDecoder = enable;
+
+        List<VideoPlayer> players = new ArrayList<>();
+        synchronized (INSTANCES_LOCK) {
+            Iterator<WeakReference<VideoPlayer>> it = INSTANCES.iterator();
+            while (it.hasNext()) {
+                VideoPlayer instance = it.next().get();
+                if (instance == null)
+                    it.remove();
+                else
+                    players.add(instance);
+            }
+        }
+        for (VideoPlayer instance : players)
+            instance.scheduleDecoderModeUpdate();
+    }
+
+    public static boolean isSoftwareDecoderRendering() {
+        return softwareOutputActive && NEEDS_SOFTWARE_UI_OVERLAY;
+    }
+
+    private static boolean deviceNeedsSoftwareUiOverlay() {
+        String identity = (Build.HARDWARE + " " + Build.BOARD + " " + Build.MANUFACTURER
+                + " " + Build.DEVICE + " " + Build.PRODUCT).toLowerCase();
+        return identity.contains("meson") || identity.contains("amlogic");
+    }
+
+    private void updateSoftwareOutputActive() {
+        if (recreatingPlayer)
+            return;
+        boolean next = false;
+        synchronized (INSTANCES_LOCK) {
+            Iterator<WeakReference<VideoPlayer>> it = INSTANCES.iterator();
+            while (it.hasNext()) {
+                VideoPlayer instance = it.next().get();
+                if (instance == null) {
+                    it.remove();
+                    continue;
+                }
+                if (instance.usingSoftwareDecoder
+                        && instance.player != null
+                        && instance.playerVisible
+                        && !instance.stopped
+                        && !instance.recreatingPlayer)
+                    next = true;
+            }
+        }
+        if (softwareOutputActive == next)
+            return;
+        softwareOutputActive = next;
+        Log.i(TAG, "software decoder output active=" + next
+                + ", uiOverlay=" + NEEDS_SOFTWARE_UI_OVERLAY);
+        if (_env != null && !next)
+            _env.requestRepaint();
+    }
+
+    public static boolean isSoftwareDecoder() {
+        return preferSoftwareDecoder;
+    }
+
+    private boolean isOnPlayerThread() {
+        return Looper.myLooper() == handler.getLooper();
+    }
+
+    private static boolean isVodUrl(String url) {
+        if (url == null || url.isEmpty())
+            return false;
+        String value = url.toLowerCase();
+        return value.contains("/vod/") || value.contains("vod:") || value.contains("hls-vod");
+    }
+
+    private boolean isVodSource() {
+        if (isVodUrl(source))
+            return true;
+        if (player == null || !isOnPlayerThread())
+            return false;
+        try {
+            if (player.isCurrentMediaItemLive())
+                return false;
+            long duration = player.getDuration();
+            return duration != TIME_UNSET && duration > 0;
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isPlaceholderUrl(String url) {
+        if (url == null || url.isEmpty())
+            return true;
+        String value = url.toLowerCase();
+        return value.contains("black.mp4")
+                || value.startsWith("asset://")
+                || value.startsWith("android.resource://")
+                || value.startsWith("res/");
+    }
+
+    private boolean isPlaceholderSource() {
+        return isPlaceholderUrl(source);
+    }
+
+    private boolean shouldUseSoftwareDecoder(int width, int height) {
+        if (!preferSoftwareDecoder || isVodSource())
+            return false;
+        if (width <= 0 || height <= 0)
+            return usingSoftwareDecoder;
+        return width <= 1280 && height <= 720;
+    }
+
+    private boolean shouldCreateWithSoftwareDecoder() {
+        if (!preferSoftwareDecoder || isVodUrl(source) || isPlaceholderSource())
+            return false;
+        if (videoWidth > 0 && videoHeight > 0)
+            return videoWidth <= 1280 && videoHeight <= 720;
+        return usingSoftwareDecoder;
+    }
+
+    private Format getHighestAvailableVideoFormat() {
+        if (tracks == null)
+            return null;
+        Format highest = null;
+        int highestPixels = 0;
+        for (Tracks.Group trackGroup : tracks.getGroups()) {
+            if (trackGroup.getType() != C.TRACK_TYPE_VIDEO)
+                continue;
+            for (int i = 0; i < trackGroup.length; i++) {
+                Format format = trackGroup.getTrackFormat(i);
+                if (format.width <= 0 || format.height <= 0)
+                    continue;
+                int pixels = format.width * format.height;
+                if (pixels > highestPixels) {
+                    highestPixels = pixels;
+                    highest = format;
+                }
+            }
+        }
+        return highest;
+    }
+
+    private int[] getDecisionVideoSize() {
+        int width = 0;
+        int height = 0;
+        Format highest = getHighestAvailableVideoFormat();
+        if (highest != null && highest.width > 0 && highest.height > 0) {
+            width = highest.width;
+            height = highest.height;
+        }
+        if (videoWidth > 0 && videoHeight > 0 && videoWidth * videoHeight > width * height) {
+            width = videoWidth;
+            height = videoHeight;
+        }
+        return new int[] { width, height };
+    }
+
+    private void scheduleDecoderModeUpdate() {
+        handler.post(new SafeRunnable() {
+            @Override
+            protected void doRun() {
+                applyDecoderModeIfNeeded();
+            }
+        });
+    }
+
+    private void applyDecoderModeIfNeeded() {
+        if (!isOnPlayerThread()) {
+            scheduleDecoderModeUpdate();
+            return;
+        }
+        if (player == null || recreatingPlayer)
+            return;
+
+        if (!preferSoftwareDecoder) {
+            if (usingSoftwareDecoder)
+                recreateWithDecoderMode(false);
+            return;
+        }
+        if (isPlaceholderSource())
+            return;
+
+        int[] size = getDecisionVideoSize();
+        int width = size[0];
+        int height = size[1];
+        if (width <= 0 || height <= 0)
+            return;
+
+        boolean shouldUseSoftware = shouldUseSoftwareDecoder(width, height);
+        Log.i(TAG, "applyDecoderModeIfNeeded: format="
+                + width + "x" + height
+                + ", vod=" + isVodSource()
+                + ", software=" + shouldUseSoftware
+                + ", current=" + usingSoftwareDecoder);
+        if (shouldUseSoftware == usingSoftwareDecoder)
+            return;
+        recreateWithDecoderMode(shouldUseSoftware);
+    }
+
+    private void recreateWithDecoderMode(boolean software) {
+        if (!isOnPlayerThread()) {
+            handler.post(new SafeRunnable() {
+                @Override
+                protected void doRun() {
+                    recreateWithDecoderMode(software);
+                }
+            });
+            return;
+        }
+        if (player == null || recreatingPlayer)
+            return;
+
+        final String sourceAtRecreate = source;
+        final long positionMs;
+        final boolean shouldPlay;
+        try {
+            positionMs = player.getCurrentPosition();
+            shouldPlay = player.getPlayWhenReady();
+        } catch (RuntimeException e) {
+            Log.w(TAG, "recreateWithDecoderMode: cannot read player state", e);
+            return;
+        }
+
+        recreatingPlayer = true;
+        paused = !shouldPlay;
+        usingSoftwareDecoder = software;
+        try {
+            releaseResourceImpl();
+            acquireResourceImpl();
+        } catch (RuntimeException e) {
+            recreatingPlayer = false;
+            Log.e(TAG, "recreateWithDecoderMode failed", e);
+            return;
+        }
+        handler.post(new SafeRunnable() {
+            @Override
+            protected void doRun() {
+                recreatingPlayer = false;
+                if (stopped) {
+                    releasePlayerKeepingDecoderMode();
+                    return;
+                }
+                updateSoftwareOutputActive();
+                if (player == null)
+                    return;
+                boolean sameSource = sourceAtRecreate != null && sourceAtRecreate.equals(source);
+                boolean live = source != null && source.contains(".m3u8") && !isVodUrl(source);
+                if (sameSource && !live && positionMs > 1000)
+                    player.seekTo(positionMs);
+                player.setPlayWhenReady(shouldPlay);
+            }
+        });
     }
 
     public void emit(String name, Object ... args) {
@@ -416,27 +691,49 @@ public final class VideoPlayer extends BaseObject implements IResource {
     }
 
     private void pollPosition() {
-        handler.post(new SafeRunnable() {
-            @Override
-            public void doRun() {
-                ExoPlayer player = VideoPlayer.this.player;
-                if (player == null)
-                    return;
+        ExoPlayer player = this.player;
+        if (player == null)
+            return;
+        if (!isOnPlayerThread()) {
+            handler.post(new SafeRunnable() {
+                @Override
+                protected void doRun() {
+                    pollPosition();
+                }
+            });
+            return;
+        }
 
-                long position = player.getCurrentPosition();
-                Timeline currentTimeline = player.getCurrentTimeline();
-                if (!currentTimeline.isEmpty()) {
-                    position -= currentTimeline.getPeriod(player.getCurrentPeriodIndex(), period)
-                            .getPositionInWindowMs();
-                }
-                final long duration = player.getDuration();
-                if (duration != TIME_UNSET) {
-                    Log.v(TAG, "emitting position " + position + " / " + duration);
-                    VideoPlayer.this.emit("timeupdate",position / 1000.0);
-                    VideoPlayer.this.emit("durationchange", duration / 1000.0);
-                }
-            }
-        });
+        int playbackState = player.getPlaybackState();
+        if (stopped || playbackState == Player.STATE_IDLE)
+            return;
+
+        long position = player.getCurrentPosition();
+        Timeline currentTimeline = player.getCurrentTimeline();
+        if (!currentTimeline.isEmpty()) {
+            position -= currentTimeline.getPeriod(player.getCurrentPeriodIndex(), period)
+                    .getPositionInWindowMs();
+        }
+        final long duration = player.getDuration();
+        if (duration == TIME_UNSET)
+            return;
+        Log.v(TAG, "emitting position " + position + " / " + duration);
+        emit("timeupdate", position / 1000.0);
+        if (duration != lastEmittedDurationMs) {
+            lastEmittedDurationMs = duration;
+            emit("durationchange", duration / 1000.0);
+        }
+    }
+
+    @OptIn(markerClass = UnstableApi.class)
+    private static boolean isAudioSinkInitFailure(PlaybackException e) {
+        Throwable cause = e.getCause();
+        while (cause != null) {
+            if (cause instanceof AudioSink.InitializationException)
+                return true;
+            cause = cause.getCause();
+        }
+        return false;
     }
 
     @OptIn(markerClass = UnstableApi.class)
@@ -453,8 +750,18 @@ public final class VideoPlayer extends BaseObject implements IResource {
 
     @OptIn(markerClass = UnstableApi.class)
     private void acquireResourceImpl() {
+        acquireResourceImpl(true);
+    }
+
+    @OptIn(markerClass = UnstableApi.class)
+    private void acquireResourceImpl(boolean loadSource) {
         if (player != null)
             return;
+        if (stopped && loadSource)
+            return;
+
+        if (!recreatingPlayer)
+            usingSoftwareDecoder = shouldCreateWithSoftwareDecoder();
 
         Context context = _env.getContext();
         DefaultLoadControl loadControl = new DefaultLoadControl.Builder()
@@ -472,9 +779,24 @@ public final class VideoPlayer extends BaseObject implements IResource {
                         .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, /* disabled= */ true)
         );
 
+        CustomRenderersFactory renderersFactory = new CustomRenderersFactory(context, new CustomTextOutput());
+        renderersFactory.setMediaCodecSelector(
+                usingSoftwareDecoder
+                        ? (mimeType, requiresSecureDecoder, requiresTunnelingDecoder) -> {
+                            if (mimeType != null && mimeType.startsWith("video/")) {
+                                return MediaCodecSelector.PREFER_SOFTWARE.getDecoderInfos(
+                                        mimeType, requiresSecureDecoder, requiresTunnelingDecoder);
+                            }
+                            return MediaCodecSelector.DEFAULT.getDecoderInfos(
+                                    mimeType, requiresSecureDecoder, requiresTunnelingDecoder);
+                        }
+                        : MediaCodecSelector.DEFAULT);
+        renderersFactory.setEnableDecoderFallback(true);
+        Log.i(TAG, "creating ExoPlayer, softwareDecoder=" + usingSoftwareDecoder);
+
         player = new ExoPlayer.Builder(context)
                 .setTrackSelector(trackSelector)
-                .setRenderersFactory(new CustomRenderersFactory(context, new CustomTextOutput()))
+                .setRenderersFactory(renderersFactory)
                 .setLoadControl(loadControl)
                 .setLooper(handler.getLooper())
                 .build();
@@ -499,12 +821,35 @@ public final class VideoPlayer extends BaseObject implements IResource {
             @Override
             public void onPlayerError(@NonNull PlaybackException error) {
                 Log.d(TAG, "onPlayerError " + error);
-                VideoPlayer.this.emit("error", error.toString());
                 if (isBehindLiveWindow(error)) {
-                    Log.i(TAG, "restarting player");
-                    releaseResource();
-                    acquireResource();
+                    VideoPlayer.this.emit("error", error.toString());
+                    handler.post(new SafeRunnable() {
+                        @Override
+                        protected void doRun() {
+                            Log.i(TAG, "restarting player");
+                            releaseResourceImpl();
+                            acquireResourceImpl();
+                        }
+                    });
+                    return;
                 }
+                if (isAudioSinkInitFailure(error)) {
+                    if (audioDisabledDueToTrackLimit || recoveringAudio || recreatingPlayer)
+                        return;
+                    recoveringAudio = true;
+                    handler.post(new SafeRunnable() {
+                        @Override
+                        protected void doRun() {
+                            try {
+                                recoverFromAudioTrackFailure();
+                            } finally {
+                                recoveringAudio = false;
+                            }
+                        }
+                    });
+                    return;
+                }
+                VideoPlayer.this.emit("error", error.toString());
             }
 
             @Override
@@ -537,6 +882,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
                     @Override
                     public void doRun() {
                         updateGeometry();
+                        applyDecoderModeIfNeeded();
                     }});
             }
 
@@ -566,36 +912,121 @@ public final class VideoPlayer extends BaseObject implements IResource {
                     ++groupIdx;
                 }
                 VideoPlayer.this.tracks = tracks;
+                applyDecoderModeIfNeeded();
             }
         });
 
         updateGeometry();
         setVisibility(playerVisible);
         player.setPlayWhenReady(autoplay);
-        if (source != null)
-            setSource(source);
+        if (loadSource && source != null)
+            applySourceOnPlayerThread(source);
 
+        final int generation = ++pollingGeneration;
         pollingTask = new SafeRunnable() {
             @Override
             protected void doRun() {
+                if (generation != pollingGeneration)
+                    return;
                 VideoPlayer.this.pollPosition();
-                if (pollingTask != null) {
-                    handler.postDelayed(pollingTask, PollingInterval);
-                }
+                if (generation == pollingGeneration)
+                    handler.postDelayed(this, PollingInterval);
             }
         };
         handler.postDelayed(pollingTask, PollingInterval);
+        updateSoftwareOutputActive();
+    }
+
+    private void releasePlayerInstance() {
+        if (player == null)
+            return;
+        try {
+            player.setPlayWhenReady(false);
+            player.stop();
+            player.clearMediaItems();
+        } catch (RuntimeException e) {
+            Log.w(TAG, "player stop/clear failed", e);
+        }
+        try {
+            player.setVideoSurfaceHolder(null);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "clear video surface failed", e);
+        }
+        player.release();
+        player = null;
+    }
+
+    // Release ExoPlayer so AudioFlinger returns AudioTrack slots. Keep decoder size/mode.
+    private void releasePlayerKeepingDecoderMode() {
+        pollingGeneration++;
+        if (pollingTask != null) {
+            handler.removeCallbacks(pollingTask);
+            pollingTask = null;
+        }
+        audioDisabledDueToTrackLimit = false;
+        tracks = null;
+        lastEmittedDurationMs = TIME_UNSET;
+        if (player != null)
+            Log.i(TAG, "releasing player to free AudioTrack");
+        releasePlayerInstance();
+        updateSoftwareOutputActive();
+    }
+
+    @OptIn(markerClass = UnstableApi.class)
+    private void recoverFromAudioTrackFailure() {
+        if (stopped || recreatingPlayer)
+            return;
+        if (audioRecoverAttempts < 1) {
+            Log.w(TAG, "AudioTrack init failed, recreating player to free audio tracks");
+            audioRecoverAttempts++;
+            boolean play = !paused;
+            releasePlayerKeepingDecoderMode();
+            stopped = false;
+            acquireResourceImpl(true);
+            if (player == null)
+                return;
+            PlaybackException pending = player.getPlayerError();
+            if (pending == null || !isAudioSinkInitFailure(pending)) {
+                player.setPlayWhenReady(play);
+                return;
+            }
+        }
+        if (player == null || audioDisabledDueToTrackLimit)
+            return;
+        Log.w(TAG, "AudioTrack init failed, continuing without audio");
+        audioDisabledDueToTrackLimit = true;
+        try {
+            player.setTrackSelectionParameters(
+                    player.getTrackSelectionParameters()
+                            .buildUpon()
+                            .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
+                            .build());
+            player.prepare();
+            player.setPlayWhenReady(true);
+        } catch (RuntimeException e) {
+            Log.e(TAG, "failed to recover from AudioTrack error", e);
+        }
     }
 
     private void releaseResourceImpl() {
-        pollingTask = null;
-        if (player != null) {
-            player.setVideoSurfaceView(null);
-            player.release();
-            player = null;
-            videoWidth = 0;
-            videoHeight = 0;
+        pollingGeneration++;
+        if (pollingTask != null) {
+            handler.removeCallbacks(pollingTask);
+            pollingTask = null;
         }
+        if (player != null) {
+            releasePlayerInstance();
+            if (!recreatingPlayer) {
+                videoWidth = 0;
+                videoHeight = 0;
+                usingSoftwareDecoder = false;
+                tracks = null;
+                lastEmittedDurationMs = TIME_UNSET;
+                audioDisabledDueToTrackLimit = false;
+                audioRecoverAttempts = 0;
+            }
+        }
+        updateSoftwareOutputActive();
     }
 
     public void setupDrm(String type, V8Object options, V8Function callback, V8Function error) {
@@ -608,12 +1039,10 @@ public final class VideoPlayer extends BaseObject implements IResource {
             @Override
             public void doRun() {
                 paused = true;
+                stopped = true;
                 VideoPlayer.this.emit("pause", true);
-                if (player != null)
-                if (player != null) {
-                    player.stop();
-                    stopped = true;
-                }
+                if (!recreatingPlayer)
+                    releasePlayerKeepingDecoderMode();
             }
         });
     }
@@ -622,46 +1051,82 @@ public final class VideoPlayer extends BaseObject implements IResource {
     public void setSource(String url) {
         Log.i(TAG, "Player.setSource " + url);
         source = url;
+        if (isOnPlayerThread()) {
+            applySourceOnPlayerThread(url);
+        } else {
+            handler.post(new SafeRunnable() {
+                @Override
+                protected void doRun() {
+                    applySourceOnPlayerThread(url);
+                }
+            });
+        }
+    }
+
+    @OptIn(markerClass = UnstableApi.class)
+    private void applySourceOnPlayerThread(String url) {
+        if (url == null || url.isEmpty() || isPlaceholderUrl(url)) {
+            paused = true;
+            stopped = true;
+            if (!recreatingPlayer)
+                releasePlayerKeepingDecoderMode();
+            return;
+        }
+
+        if (!recoveringAudio)
+            audioRecoverAttempts = 0;
+
+        if (player != null && !recreatingPlayer && !recoveringAudio)
+            releasePlayerKeepingDecoderMode();
+
+        if (player == null)
+            acquireResourceImpl(false);
+
         if (player == null)
             return;
 
-        if (source == null || source.isEmpty()) {
-            stop();
+        if (usingSoftwareDecoder && isVodUrl(url)) {
+            recreateWithDecoderMode(false);
             return;
         }
 
         stopped = false;
+        if (audioDisabledDueToTrackLimit) {
+            audioDisabledDueToTrackLimit = false;
+            try {
+                player.setTrackSelectionParameters(
+                        player.getTrackSelectionParameters()
+                                .buildUpon()
+                                .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
+                                .build());
+            } catch (RuntimeException e) {
+                Log.w(TAG, "re-enable audio failed", e);
+            }
+        }
 
         DataSource.Factory dataSourceFactory = new DefaultDataSource.Factory(_env.getContext());
-
-        SubtitleDecoderFactory subtitleDecoderFactory = SubtitleDecoderFactory.DEFAULT;
-        BaseMediaSource source;
+        BaseMediaSource mediaSource;
         if (url.contains(".m3u8")) { //FIXME: add proper content type here
             HlsMediaSource.Factory factory = new HlsMediaSource.Factory(dataSourceFactory);
             factory.setExtractorFactory(new DefaultHlsExtractorFactory(hlsExtractorFlags, exposeCea608WhenMissingDeclarations))
                     .setAllowChunklessPreparation(true);
-            source = factory.createMediaSource(MediaItem.fromUri(Uri.parse(url)));
+            mediaSource = factory.createMediaSource(MediaItem.fromUri(Uri.parse(url)));
         } else {
             ProgressiveMediaSource.Factory factory = new ProgressiveMediaSource.Factory(dataSourceFactory);
-            source = factory.createMediaSource(MediaItem.fromUri(Uri.parse(url)));
+            mediaSource = factory.createMediaSource(MediaItem.fromUri(Uri.parse(url)));
         }
 
-        source.addEventListener(handler, new MediaSourceEventListener() {
+        mediaSource.addEventListener(handler, new MediaSourceEventListener() {
             @Override
             public void onLoadError(int windowIndex, @Nullable MediaSource.MediaPeriodId mediaPeriodId, @NonNull LoadEventInfo loadEventInfo, @NonNull MediaLoadData mediaLoadData, @NonNull IOException error, boolean wasCanceled) {
                 Log.w(TAG, "onLoadError");
-                // VideoPlayer.this.emit("error", "Source load error: " + error.getLocalizedMessage());
             }
         });
 
-        handler.post(new SafeRunnable() {
-            @Override
-            public void doRun() {
-                player.setMediaSource(source, true);
-                player.prepare();
-                Log.i(TAG, "Player.setSource exited");
-            }
-        });
+        player.setMediaSource(mediaSource, true);
+        player.prepare();
+        updateSoftwareOutputActive();
+        Log.i(TAG, "Player.setSource exited");
     }
 
     public void setLoop(boolean loop) {
@@ -677,14 +1142,23 @@ public final class VideoPlayer extends BaseObject implements IResource {
         handler.post(new SafeRunnable() {
             @Override
             public void doRun() {
+                if (stopped) {
+                    stopped = false;
+                    if (source != null)
+                        applySourceOnPlayerThread(source);
+                    paused = false;
+                    VideoPlayer.this.emit("pause", false);
+                    if (player != null)
+                        player.setPlayWhenReady(true);
+                    updateSoftwareOutputActive();
+                    return;
+                }
                 if (paused) {
                     paused = false;
                     VideoPlayer.this.emit("pause", false);
                     if (player != null)
                         player.setPlayWhenReady(true);
-                } else if (stopped) {
-                    stopped = false;
-                    setSource(source);
+                    updateSoftwareOutputActive();
                 } else {
                     Log.i(TAG, "ignoring play on non-paused stream");
                 }
@@ -715,12 +1189,11 @@ public final class VideoPlayer extends BaseObject implements IResource {
         handler.post(new SafeRunnable() {
             @Override
             public void doRun() {
-                //FIXME: save position if resources reacquired
+                if (player == null)
+                    return;
                 long newPos = player.getCurrentPosition() + pos * 1000L;
                 VideoPlayer.this.emit("timeupdate", newPos / 1000.0);
-
-                if (player != null)
-                    player.seekTo(newPos);
+                player.seekTo(newPos);
             }
         });
     }
@@ -849,6 +1322,8 @@ public final class VideoPlayer extends BaseObject implements IResource {
         handler.post(new SafeRunnable() {
             @Override
             public void doRun() {
+                if (player == null)
+                    return;
                 player.setTrackSelectionParameters(
                         player.getTrackSelectionParameters()
                                 .buildUpon()
@@ -867,6 +1342,8 @@ public final class VideoPlayer extends BaseObject implements IResource {
         String[] groupAndId = trackId.split("\\.");
         if (groupAndId.length != 2)
             throw new RuntimeException("invalid trackId format");
+        if (tracks == null)
+            return;
 
         int groupId = Integer.parseInt(groupAndId[0]);
         int trackIdx = Integer.parseInt(groupAndId[1]);
@@ -876,6 +1353,8 @@ public final class VideoPlayer extends BaseObject implements IResource {
         handler.post(new SafeRunnable() {
             @Override
             public void doRun() {
+                if (player == null)
+                    return;
                 player.setTrackSelectionParameters(
                         player.getTrackSelectionParameters()
                                 .buildUpon()
@@ -930,6 +1409,12 @@ public final class VideoPlayer extends BaseObject implements IResource {
         playerVisible = visible;
         Log.i(TAG, "Player.setVisibility " + visible);
         viewHolder.update(_env.getRootView(), visible);
+        handler.post(new SafeRunnable() {
+            @Override
+            protected void doRun() {
+                updateSoftwareOutputActive();
+            }
+        });
     }
 
     @Override
@@ -956,6 +1441,20 @@ public final class VideoPlayer extends BaseObject implements IResource {
     public void discard() {
         super.discard();
         viewHolder.discard(_env.getRootView());
-        releaseResource();
+        handler.post(new SafeRunnable() {
+            @Override
+            protected void doRun() {
+                releaseResourceImpl();
+                playerThread.quitSafely();
+            }
+        });
+        synchronized (INSTANCES_LOCK) {
+            Iterator<WeakReference<VideoPlayer>> it = INSTANCES.iterator();
+            while (it.hasNext()) {
+                VideoPlayer instance = it.next().get();
+                if (instance == null || instance == this)
+                    it.remove();
+            }
+        }
     }
 }
