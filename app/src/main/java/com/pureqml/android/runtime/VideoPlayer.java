@@ -5,6 +5,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
+import android.graphics.RectF;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -252,7 +253,7 @@ public final class VideoPlayer extends BaseObject implements IResource {
     //exoplayer flags
     private int                         hlsExtractorFlags = 0;
     private boolean                     exposeCea608WhenMissingDeclarations = true;
-    private final static float          defaultTextSizeSP = 22;
+    private final static float          defaultTextSizeSP = 31;
 
     private static class PaintDelegate implements Element.PaintDelegate {
         final Context context;
@@ -274,6 +275,13 @@ public final class VideoPlayer extends BaseObject implements IResource {
             float lineHeight = textSize * ComputedStyle.DefaultLineHeight;
             TextPaint paint = new TextPaint(Paint.ANTI_ALIAS_FLAG | Paint.LINEAR_TEXT_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
             paint.setTextSize(textSize);
+
+            // Настройка фона
+            Paint backgroundPaint = new Paint();
+            backgroundPaint.setColor(Color.argb(150, 0, 0, 0)); // Полупрозрачный черный
+            backgroundPaint.setStyle(Paint.Style.FILL);
+            float backgroundPadding = textSize * 0.2f; // Отступы вокруг текста
+
             for(Cue cue : cueGroup.cues) {
                 if (cue.text == null && cue.bitmap == null)
                     continue;
@@ -354,8 +362,59 @@ public final class VideoPlayer extends BaseObject implements IResource {
                                 break;
                         }
                     }
+
+                    // Рисуем фон для всех строк субтитров
+                    // Сначала вычисляем размеры текста
+                    float maxWidth = 0;
+                    float totalHeight = text.length * lineHeight;
+                    float[] lineWidths = new float[text.length];
+                    for (int i = 0; i < text.length; i++) {
+                        lineWidths[i] = paint.measureText(text[i]);
+                        if (lineWidths[i] > maxWidth) maxWidth = lineWidths[i];
+                    }
+                    
+                    // Вычисляем позицию для фона
+                    float bgLeft, bgRight;
+                    switch(paint.getTextAlign()) {
+                        case LEFT:
+                            bgLeft = x - backgroundPadding;
+                            bgRight = x + maxWidth + backgroundPadding;
+                            break;
+                        case RIGHT:
+                            bgLeft = x - maxWidth - backgroundPadding;
+                            bgRight = x + backgroundPadding;
+                            break;
+                        case CENTER:
+                        default:
+                            bgLeft = x - maxWidth/2 - backgroundPadding;
+                            bgRight = x + maxWidth/2 + backgroundPadding;
+                            break;
+                    }
+                    
+                    // y is the first-line baseline; descenders (р, у, g, p) go below it.
+                    Paint.FontMetrics fm = paint.getFontMetrics();
+                    float outlinePad = 3f / 2f;
+                    float lastBaseline = y + (text.length - 1) * lineHeight;
+                    float bgTop = y + fm.ascent - outlinePad - backgroundPadding;
+                    float bgBottom = lastBaseline + fm.descent + outlinePad + backgroundPadding;
+
+                    // HLS last-line cues sit one row from the bottom. Double that gap
+                    // so the whole block (background + text) sits twice as high.
+                    float gapBelow = rect.bottom - bgBottom;
+                    if (gapBelow > 0 && gapBelow < lineHeight * 2.5f) {
+                        y -= gapBelow;
+                        bgTop -= gapBelow;
+                        bgBottom -= gapBelow;
+                    }
+                    
+                    // Рисуем прямоугольник фона с закругленными углами
+                    RectF bgRect = new RectF(bgLeft, bgTop, bgRight, bgBottom);
+                    state.drawRoundRect(bgRect, 8f, 8f, backgroundPaint);
+                    
+
                     for(String line : text) {
                         paint.setStyle(Paint.Style.STROKE);
+                        paint.setStrokeWidth(3f);
                         paint.setColor(Color.BLACK);
                         state.drawText(line, x, y, paint);
                         paint.setStyle(Paint.Style.FILL);
