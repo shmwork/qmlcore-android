@@ -3,6 +3,7 @@ package com.pureqml.android.runtime;
 import android.net.http.HttpResponseCache;
 import android.util.Log;
 
+import com.eclipsesource.v8.JavaVoidCallback;
 import com.eclipsesource.v8.V8;
 import com.eclipsesource.v8.V8Array;
 import com.eclipsesource.v8.V8Function;
@@ -35,6 +36,7 @@ public final class HttpRequest {
         byte []                 _body;
         V8Function              _callback;
         V8Function              _error;
+        volatile boolean        _aborted;
 
         private void setProperty(String key, Object value) throws IOException {
             switch (key) {
@@ -70,14 +72,32 @@ public final class HttpRequest {
                 case "error":
                     _error = (V8Function) value;
                     break;
+                case "settings":
+                case "timeout":
+                    break;
                 default:
                     Log.w(TAG, "unhandled request field " + key);
                     break;
             }
         }
 
+        void abort() {
+            _aborted = true;
+            HttpURLConnection connection = _connection;
+            if (connection != null) {
+                try {
+                    connection.disconnect();
+                } catch (Exception e) {
+                    Log.v(TAG, "abort disconnect", e);
+                }
+            }
+        }
+
         @Override
         public void doRun() {
+            if (_aborted)
+                return;
+
             int code;
             String text;
             ExecutorService executor = _env.getExecutor();
@@ -104,11 +124,16 @@ public final class HttpRequest {
                 Log.d(TAG, "converted to text");
                 //Log.d(TAG, "response text: " + text);
 
+                if (_aborted)
+                    return;
+
                 final int argCode = code;
                 final String argText = text;
                 executor.execute(new SafeRunnable() {
                     @Override
                     public void doRun() {
+                        if (_aborted)
+                            return;
                         if (_callback != null && !_callback.isReleased()) {
                             try (V8Array args = createEventArguments(argCode, argText)) {
                                 _callback.call(null, args);
@@ -119,16 +144,21 @@ public final class HttpRequest {
                     }
                 });
             } catch (final Exception e) {
+                if (_aborted)
+                    return;
                 Log.w(TAG, "http connection failed", e);
                 executor.execute(new SafeRunnable() {
                     @Override
                     public void doRun() {
+                        if (_aborted)
+                            return;
                         emitError(e);
                     }
                 });
             }
             finally {
-                _connection.disconnect();
+                if (_connection != null)
+                    _connection.disconnect();
             }
         }
 
@@ -143,6 +173,8 @@ public final class HttpRequest {
             byte[] buffer = new byte[4096];
             int length;
             while ((length = inputStream.read(buffer)) != -1) {
+                if (_aborted)
+                    throw new IOException("aborted");
                 dataOutputStream.write(buffer, 0, length);
             }
             return dataOutputStream;
@@ -214,7 +246,7 @@ public final class HttpRequest {
         }
     }
 
-    public static void request(IExecutionEnvironment env, V8Array arguments) {
+    public static Object request(IExecutionEnvironment env, V8Array arguments) {
         if (arguments.length() < 1) {
             throw new IllegalArgumentException("not enough arguments for httpRequest");
         }
@@ -222,7 +254,15 @@ public final class HttpRequest {
         V8Object request = (V8Object)arguments.get(0);
         arguments.close();
 
-        new Request(env, request);
-        request.close();
+        Request req = new Request(env, request);
+
+        V8Object handle = new V8Object(env.getRuntime());
+        handle.registerJavaMethod(new JavaVoidCallback() {
+            @Override
+            public void invoke(V8Object receiver, V8Array parameters) {
+                req.abort();
+            }
+        }, "abort");
+        return handle;
     }
 }
