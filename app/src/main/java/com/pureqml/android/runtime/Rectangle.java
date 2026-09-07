@@ -161,11 +161,20 @@ public final class Rectangle extends Element {
     protected PaintState createChildrenPaintState(PaintState state) {
         float bw = _borderWidth;
         if (bw > 0) {
-            if (_radius > 0 && getClip()) {
+            if (hasRoundCorners() && getClip()) {
                 Path path = new Path();
                 Rect rect = getRect();
-                float r = _radius - bw / 2.0f;
-                path.addRoundRect(state.baseX + bw, state.baseY + bw, state.baseX + rect.width() - bw, state.baseY + rect.height() - bw, r, r, Path.Direction.CW);
+                RectF clip = new RectF(
+                        state.baseX + bw,
+                        state.baseY + bw,
+                        state.baseX + rect.width() - bw,
+                        state.baseY + rect.height() - bw
+                );
+                float[] radii = getCornerRadii(bw / 2.0f);
+                if (radii != null)
+                    path.addRoundRect(clip, radii, Path.Direction.CW);
+                else
+                    path.addRect(clip, Path.Direction.CW);
                 if (!state.clipPath(path))
                     return state;
             }
@@ -201,8 +210,11 @@ public final class Rectangle extends Element {
 
             Paint paint = patchAlpha(_background, Color.alpha(_color), opacity);
             if (paint != null) {
-                if (_radius > 0) {
-                    state.drawRoundRect(rect, _radius, _radius, paint);
+                if (hasRoundCorners()) {
+                    if (isUniformRadius())
+                        state.drawRoundRect(rect, _radiusTl, _radiusTl, paint);
+                    else
+                        state.drawRoundRect(rect, getCornerRadii(), paint);
                 } else {
                     state.drawRect(rect, paint);
                 }
@@ -217,8 +229,11 @@ public final class Rectangle extends Element {
                 inset -= _borderWidth;
             borderRect.inset(inset, inset);
             if (paint != null) {
-                if (_radius > 0) {
-                    state.drawRoundRect(borderRect, _radius, _radius, paint);
+                if (hasRoundCorners()) {
+                    if (isUniformRadius())
+                        state.drawRoundRect(borderRect, _radiusTl, _radiusTl, paint);
+                    else
+                        state.drawRoundRect(borderRect, getCornerRadii(), paint);
                 } else {
                     state.drawRect(borderRect, paint);
                 }
