@@ -9,6 +9,7 @@ import android.graphics.Picture;
 import android.graphics.Point;
 import android.graphics.PointF;
 import android.graphics.Rect;
+import android.graphics.RectF;
 import android.os.Build;
 import android.os.SystemClock;
 import android.util.Log;
@@ -54,6 +55,11 @@ public class Element extends BaseObject {
     protected boolean           _globallyVisible;
     private boolean             _clip;
     protected int               _radius = 0;
+    protected float             _radiusTl = 0;
+    protected float             _radiusTr = 0;
+    protected float             _radiusBr = 0;
+    protected float             _radiusBl = 0;
+    protected float[]           _radii;
     protected Element           _parent;
     protected int               _z;
     private boolean             _cache = false;
@@ -464,10 +470,7 @@ public class Element extends BaseObject {
                 break;
 
             case "border-radius":
-                try
-                { _radius = toInteger(value); }
-                catch(Exception ex)
-                { Log.w(TAG, "unsupported radius spec", ex); }
+                setBorderRadius(value);
                 break;
 
             default:
@@ -506,8 +509,111 @@ public class Element extends BaseObject {
             ((Releasable)arg0).release();
     }
 
+    private static float parseCssPx(String token) {
+        if (token == null || token.isEmpty())
+            return 0;
+        if (token.endsWith("px") || token.endsWith("PX"))
+            token = token.substring(0, token.length() - 2);
+        try {
+            float v = Float.parseFloat(token);
+            if (Float.isNaN(v) || Float.isInfinite(v) || v < 0)
+                return 0;
+            return v;
+        } catch (NumberFormatException ex) {
+            return 0;
+        }
+    }
+
+    private void setBorderRadius(Object value) {
+        float tl = 0, tr = 0, br = 0, bl = 0;
+        if (value instanceof Number) {
+            float r = ((Number) value).floatValue();
+            if (Float.isNaN(r) || Float.isInfinite(r) || r < 0)
+                r = 0;
+            tl = tr = br = bl = r;
+        } else if (value != null) {
+            String[] parts = value.toString().trim().split("\\s+");
+            float[] parsed = new float[parts.length];
+            for (int i = 0; i < parts.length; ++i)
+                parsed[i] = parseCssPx(parts[i]);
+            switch (parsed.length) {
+                case 1:
+                    tl = tr = br = bl = parsed[0];
+                    break;
+                case 2:
+                    tl = br = parsed[0];
+                    tr = bl = parsed[1];
+                    break;
+                case 3:
+                    tl = parsed[0];
+                    tr = bl = parsed[1];
+                    br = parsed[2];
+                    break;
+                case 4:
+                    tl = parsed[0];
+                    tr = parsed[1];
+                    br = parsed[2];
+                    bl = parsed[3];
+                    break;
+                default:
+                    Log.w(TAG, "unsupported radius spec: " + value);
+                    return;
+            }
+        }
+        _radiusTl = tl;
+        _radiusTr = tr;
+        _radiusBr = br;
+        _radiusBl = bl;
+        updateRadiiCache();
+    }
+
+    private void updateRadiiCache() {
+        if (_radiusTl <= 0 && _radiusTr <= 0 && _radiusBr <= 0 && _radiusBl <= 0) {
+            _radii = null;
+            _radius = 0;
+            return;
+        }
+        if (_radii == null)
+            _radii = new float[8];
+        _radii[0] = _radii[1] = _radiusTl;
+        _radii[2] = _radii[3] = _radiusTr;
+        _radii[4] = _radii[5] = _radiusBr;
+        _radii[6] = _radii[7] = _radiusBl;
+        _radius = (int) Math.ceil(Math.max(Math.max(_radiusTl, _radiusTr), Math.max(_radiusBr, _radiusBl)));
+    }
+
+    protected boolean hasRoundCorners() {
+        return _radii != null;
+    }
+
+    protected boolean isUniformRadius() {
+        return _radiusTl == _radiusTr && _radiusTr == _radiusBr && _radiusBr == _radiusBl;
+    }
+
+    protected float[] getCornerRadii() {
+        return _radii;
+    }
+
+    protected float[] getCornerRadii(float inset) {
+        if (_radii == null)
+            return null;
+        if (inset == 0)
+            return _radii;
+        return new float[] {
+            Math.max(0, _radiusTl - inset), Math.max(0, _radiusTl - inset),
+            Math.max(0, _radiusTr - inset), Math.max(0, _radiusTr - inset),
+            Math.max(0, _radiusBr - inset), Math.max(0, _radiusBr - inset),
+            Math.max(0, _radiusBl - inset), Math.max(0, _radiusBl - inset)
+        };
+    }
+
     private boolean roundClippingNeeded() {
-        return _radius > 0 && android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP;
+        return _radii != null && android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP;
+    }
+
+    private static void addRoundClipPath(Path path, Element element, float left, float top, float right, float bottom) {
+        RectF rect = new RectF(left, top, right, bottom);
+        path.addRoundRect(rect, element._radii, Path.Direction.CW);
     }
 
     private void beginPaint(PaintState state) {
@@ -587,12 +693,12 @@ public class Element extends BaseObject {
                     if (clip) {
                         if (fitParentRect && roundClippingNeeded()) {
                             Path path = new Path();
-                            path.addRoundRect(state.baseX, state.baseY, state.baseX + childWidth, state.baseY + childHeight, _radius, _radius, Path.Direction.CW);
+                            addRoundClipPath(path, this, state.baseX, state.baseY, state.baseX + childWidth, state.baseY + childHeight);
                             if (!state.clipPath(path))
                                 paint = false;
                         } else if (child.roundClippingNeeded()) {
                             Path path = new Path();
-                            path.addRoundRect(state.baseX, state.baseY, state.baseX + childWidth, state.baseY + childHeight, child._radius, child._radius, Path.Direction.CW);
+                            addRoundClipPath(path, child, state.baseX, state.baseY, state.baseX + childWidth, state.baseY + childHeight);
                             if (!state.clipPath(path))
                                 paint = false;
                         } else {
