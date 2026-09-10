@@ -325,6 +325,15 @@ public final class ExecutionEnvironment extends Service
         }, "getIntentParam");
 
         v8FD.registerJavaMethod((v8Object, v8Array) -> {
+            if (v8Array.length() < 1) {
+                throw new RuntimeException("updateTvHomeChannels feature requires one argument");
+            }
+            String channelsJson = v8Array.get(0).toString();
+            Log.i(TAG, "updateTvHomeChannels: " + channelsJson.length() + " chars");
+            TvHomePublisher.publishChannelsJson(getContext(), channelsJson);
+        }, "updateTvHomeChannels");
+
+        v8FD.registerJavaMethod((v8Object, v8Array) -> {
             HttpRequest.request(ExecutionEnvironment.this, v8Array);
         }, "httpRequest");
 
@@ -1211,6 +1220,23 @@ public final class ExecutionEnvironment extends Service
 
     public void resume() {
         updateActiveState(true);
+    }
+
+    /**
+     * Вызывается из MainActivity.onNewIntent, когда при уже запущенном
+     * приложении пришел диплинк. QML-сторона подписана на "newIntent"
+     * и перечитывает extras интента (см. getIntentParam).
+     */
+    public void notifyNewIntent() {
+        _executor.execute(new SafeRunnable() {
+            @Override
+            public void doRun() {
+                Log.i(TAG, "notifyNewIntent");
+                if (_rootElement != null) {
+                    _rootElement.emit(_rootObject, "newIntent");
+                }
+            }
+        });
     }
 
     public View getFocusedView() {

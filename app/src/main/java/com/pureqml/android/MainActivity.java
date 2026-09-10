@@ -120,7 +120,16 @@ public final class MainActivity
                     @Override
                     public String getIntentParam(String paramName) {
                         Log.i(TAG, "get getIntentParam " + paramName);
-                        return getIntent().getStringExtra(paramName);
+                        Intent intent = getIntent();
+                        if (intent == null)
+                            return null;
+                        String value = intent.getStringExtra(paramName);
+                        // Параметр диплинка отдаем только один раз: иначе один и тот же
+                        // интент будет перечитываться на каждом onResume и диплинк
+                        // будет срабатывать повторно после сворачивания приложения.
+                        if (value != null)
+                            intent.removeExtra(paramName);
+                        return value;
                     }
 
                     @Override
@@ -297,6 +306,20 @@ public final class MainActivity
         _executionEnvironmentBound = true;
     }
 
+	@Override
+	protected void onNewIntent(Intent intent) {
+		super.onNewIntent(intent);
+		Log.i(TAG, "onNewIntent: " + intent);
+		setIntent(intent);
+		// Диплинк при уже запущенном приложении: сообщаем рантайму, чтобы QML перечитал extras.
+		// (onResume -> closeAppHandler сработает только если приложение было свернуто)
+		if (_executionEnvironment != null
+				&& Intent.ACTION_VIEW.equals(intent.getAction())
+				&& intent.hasExtra("url")) {
+			_executionEnvironment.notifyNewIntent();
+		}
+	}
+
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
         Log.i(TAG, "onConfigurationChanged: keyboard: " + newConfig.keyboard + ", hidden: " + newConfig.keyboardHidden + ", hard keyboard hidden: " + newConfig.hardKeyboardHidden);
@@ -462,12 +485,6 @@ public final class MainActivity
             unbindService(_executionEnvironmentConnection);
         _mainView = null;
         super.onDestroy();
-    }
-
-    @Override
-    protected void onNewIntent(Intent intent) {
-        super.onNewIntent(intent);
-        Log.i(TAG, "onNewIntent");
     }
 
     @Override
