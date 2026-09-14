@@ -30,7 +30,6 @@ public final class Image extends Element implements ImageLoadedCallback {
     final Paint                 _paint;
 
     private enum Position { LeftOrTop, Center, RightOrBottom }
-
     private enum Mode { Percentage, Absolute, Cover, Contain }
 
     static int getPosition(Position position, int imageSize, int rectSize) {
@@ -45,23 +44,24 @@ public final class Image extends Element implements ImageLoadedCallback {
     }
 
     private final class Background {
-        Mode        mode        = Mode.Absolute;
-        Position    position    = Position.LeftOrTop;
-        int         percentage  = 100;
-        int         size        = 0;
+        Mode     mode       = Mode.Absolute;
+        Position position   = Position.LeftOrTop;
+        int      percentage = 100;
+        int      size       = 0;
+        boolean  repeat     = false;
 
-        public boolean repeat   = false;
-
-        public void setPosition(String value) {
-            switch(value) {
+        void setPosition(String value) {
+            switch (value) {
                 case "left":
+                case "top":
                     position = Position.LeftOrTop;
-                    break;
-                case "right":
-                    position = Position.RightOrBottom;
                     break;
                 case "center":
                     position = Position.Center;
+                    break;
+                case "right":
+                case "bottom":
+                    position = Position.RightOrBottom;
                     break;
                 default:
                     Log.w(TAG, "invalid position: " + value);
@@ -70,23 +70,31 @@ public final class Image extends Element implements ImageLoadedCallback {
             }
         }
 
-        public void resetSize() {
+        void resetSize() {
             mode = Mode.Percentage;
             percentage = 100;
         }
 
-        public void resetPosition() {
-            position = Position.LeftOrTop;
-        }
-
-        public void setBackgroundSize(String value) {
-            if (value.endsWith("%")) {
-                mode = Mode.Percentage;
-                percentage = Integer.valueOf(value.substring(0, value.length() - 1), 10);
+        void setBackgroundSize(String value) {
+            if (value == null) {
+                resetSize();
                 return;
             }
 
-            switch(value) {
+            value = value.trim();
+
+            if (value.endsWith("%")) {
+                mode = Mode.Percentage;
+                try {
+                    percentage = Integer.parseInt(value.substring(0, value.length() - 1), 10);
+                } catch (Exception e) {
+                    percentage = 100;
+                    Log.w(TAG, "invalid percentage background-size: " + value, e);
+                }
+                return;
+            }
+
+            switch (value) {
                 case "auto":
                     resetSize();
                     break;
@@ -102,8 +110,9 @@ public final class Image extends Element implements ImageLoadedCallback {
                         mode = Mode.Absolute;
                     } catch (Exception e) {
                         resetSize();
-                        Log.w(TAG, "parsing background size failed: ", e);
+                        Log.w(TAG, "parsing background size failed: " + value, e);
                     }
+                    break;
             }
         }
 
@@ -111,57 +120,67 @@ public final class Image extends Element implements ImageLoadedCallback {
             return Image.getPosition(position, imageSize, rectSize);
         }
 
-        public boolean needClip(Background y) {
-            return repeat || y.repeat || mode == Mode.Cover;
+        boolean needClip(Background y) {
+            return repeat || y.repeat || mode == Mode.Cover || y.mode == Mode.Cover;
         }
 
-        public void merge(Background y, Rect dst, Rect src) {
-            //Log.v(TAG, "merge in " + mode + " " + dst + " ← " + src);
-            float aspect;
-            float wx, hx;
-            final int dstWidth = dst.width(), dstHeight = dst.height();
-            final int srcWidth = src.width(), srcHeight = src.height();
-            int dx, dy;
+        void merge(Background y, Rect dst, Rect src) {
+            int containerLeft = dst.left;
+            int containerTop = dst.top;
+            int containerWidth = dst.width();
+            int containerHeight = dst.height();
 
-            switch(mode) {
+            int drawWidth = containerWidth;
+            int drawHeight = containerHeight;
+
+            switch (mode) {
                 case Percentage:
-                    dx = dstWidth - (dstWidth * percentage) / 100;
-                    dy = dstHeight - (dstHeight * y.percentage) / 100;
-                    dst.left += dx / 2;
-                    dst.right -= (dx - dx / 2);
-                    dst.top += dy / 2;
-                    dst.bottom -= (dy - dy / 2);
+                    drawWidth = (containerWidth * percentage) / 100;
                     break;
                 case Absolute:
-                    dst.right = dst.left + size;
-                    dst.bottom = dst.top + y.size;
+                    drawWidth = size;
                     break;
                 case Contain:
-                case Cover:
-                    wx = 1.0f * dstWidth / srcWidth;
-                    hx = 1.0f * dstHeight / srcHeight;
-                    float x = mode == Mode.Contain? Math.min(wx, hx): Math.max(wx, hx);
-
-                    int scaledWidth = Math.round(srcWidth * x);
-                    int scaledHeight = Math.round(srcHeight * x);
-
-                    dx = dstWidth - scaledWidth;
-                    dy = dstHeight - scaledHeight;
-
-                    dst.left += _backgroundX.getPosition(scaledWidth, dstWidth);
-                    dst.top += y.getPosition(scaledHeight, dstHeight);
-
-                    dst.right = dst.left + scaledWidth;
-                    dst.bottom = dst.top + scaledHeight;
+                case Cover: {
+                    float wx = 1.0f * containerWidth / src.width();
+                    float hx = 1.0f * containerHeight / src.height();
+                    float scale = mode == Mode.Contain ? Math.min(wx, hx) : Math.max(wx, hx);
+                    drawWidth = Math.round(src.width() * scale);
+                    drawHeight = Math.round(src.height() * scale);
                     break;
-                default:
-                    break;
+                }
             }
-            //Log.v(TAG, "merge out " + mode + " " + dst + " ← " + src);
+
+            switch (y.mode) {
+                case Percentage:
+                    drawHeight = (containerHeight * y.percentage) / 100;
+                    break;
+                case Absolute:
+                    drawHeight = y.size;
+                    break;
+                case Contain:
+                case Cover: {
+                    float wx = 1.0f * containerWidth / src.width();
+                    float hx = 1.0f * containerHeight / src.height();
+                    float scale = y.mode == Mode.Contain ? Math.min(wx, hx) : Math.max(wx, hx);
+                    drawWidth = Math.round(src.width() * scale);
+                    drawHeight = Math.round(src.height() * scale);
+                    break;
+                }
+            }
+
+            int left = containerLeft + getPosition(drawWidth, containerWidth);
+            int top = containerTop + y.getPosition(drawHeight, containerHeight);
+
+            dst.left = left;
+            dst.top = top;
+            dst.right = left + drawWidth;
+            dst.bottom = top + drawHeight;
         }
     }
-    final Background                  _backgroundX = new Background();
-    final Background                  _backgroundY = new Background();
+
+    final Background _backgroundX = new Background();
+    final Background _backgroundY = new Background();
 
     public Image(IExecutionEnvironment env) {
         super(env);
@@ -277,6 +296,8 @@ public final class Image extends Element implements ImageLoadedCallback {
     }
 
     private static final String regexWS = "\\s+";
+    private int _backgroundColor = 0x00000000; // transparent
+    private boolean _hasBackgroundColor = false;
 
     @Override
     protected void setStyle(String name, Object value) {
@@ -292,6 +313,19 @@ public final class Image extends Element implements ImageLoadedCallback {
             case "background-position-y":
                 _backgroundY.setPosition(value.toString());
                 break;
+            case "background-position": {
+                String[] pos = value.toString().trim().split(regexWS);
+                if (pos.length == 1) {
+                    _backgroundX.setPosition(pos[0]);
+                    _backgroundY.setPosition(pos[0]);
+                } else if (pos.length >= 2) {
+                    _backgroundX.setPosition(pos[0]);
+                    _backgroundY.setPosition(pos[1]);
+                } else {
+                    Log.w(TAG, "malformed background-position: " + value);
+                }
+                break;
+            }
             case "background-size": {
                 String[] size = value.toString().split(regexWS);
                 if (size.length == 1) {
@@ -327,6 +361,16 @@ public final class Image extends Element implements ImageLoadedCallback {
                 }
                 break;
             }
+            case "background-color": {
+                try {
+                    _backgroundColor = android.graphics.Color.parseColor(value.toString());
+                    _hasBackgroundColor = true;
+                } catch (Exception e) {
+                    _hasBackgroundColor = false;
+                    Log.w(TAG, "invalid background-color: " + value, e);
+                }
+                break;
+            }
             default:
                 super.setStyle(name, value);
                 return;
@@ -357,7 +401,37 @@ public final class Image extends Element implements ImageLoadedCallback {
     }
 
     @Override
+    public void onImageLoadFailed(final URI url, final Throwable error) {
+        Executor executor = _env.getExecutor();
+        if (executor == null) {
+            Log.d(TAG, "skipping error callback, executor is dead");
+            return;
+        }
+
+        executor.execute(new SafeRunnable() {
+            @Override
+            public void doRun() {
+                Log.w(TAG, "image load failed " + url, error);
+                if (_url == null || !_url.equals(url)) {
+                    return;
+                }
+                // Leave _loadRequested set so paint will not start another decode
+                // until load() runs again (source change / explicit reload).
+                invokeLoadCallback(null);
+            }
+        });
+    }
+
+    @Override
     public void paintElementSpecificBeforeChildren(PaintState state) {
+        Rect dst = getDstRect(state);
+
+        if (_hasBackgroundColor) {
+            Paint bg = new Paint();
+            bg.setColor(_backgroundColor);
+            state.drawRect(dst, bg);
+        }
+
         if (_url == null)
             return;
 
@@ -373,42 +447,76 @@ public final class Image extends Element implements ImageLoadedCallback {
             return;
         }
 
-        Rect dst = getDstRect(state);
-
         _paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.SRC_OVER));
-
         Paint paint = patchAlpha(_paint, 255, state.opacity);
-        if (paint != null) {
-            boolean clip = _backgroundX.needClip(_backgroundY);
-            boolean doPaint = true;
-            if (clip) {
-                state.save();
-                if (!state.clipRect(dst))
-                    doPaint = false;
+        if (paint == null)
+            return;
+
+        Rect src = new Rect(0, 0, bitmap.getWidth(), bitmap.getHeight());
+
+        // Default Absolute size is 0 until QML applies background-size. Cover-scale
+        // avoids a black/empty frame when the bitmap is already available.
+        if (_backgroundX.mode == Mode.Absolute && _backgroundX.size == 0
+                && _backgroundY.mode == Mode.Absolute && _backgroundY.size == 0) {
+            float wx = 1.0f * dst.width() / src.width();
+            float hx = 1.0f * dst.height() / src.height();
+            float x = Math.max(wx, hx);
+            int scaledWidth = Math.round(src.width() * x);
+            int scaledHeight = Math.round(src.height() * x);
+            int dx = dst.width() - scaledWidth;
+            int dy = dst.height() - scaledHeight;
+            Rect scaled = new Rect(dst);
+            scaled.left += dx / 2;
+            scaled.top += dy / 2;
+            scaled.right = scaled.left + scaledWidth;
+            scaled.bottom = scaled.top + scaledHeight;
+            state.drawBitmap(bitmap, src, scaled, paint);
+            return;
+        }
+
+        Rect drawDst = new Rect(dst);
+        _backgroundX.merge(_backgroundY, drawDst, src);
+
+        boolean repeatX = _backgroundX.repeat;
+        boolean repeatY = _backgroundY.repeat;
+        boolean clip = _backgroundX.needClip(_backgroundY);
+        boolean doPaint = true;
+        if (clip) {
+            state.save();
+            if (!state.clipRect(dst))
+                doPaint = false;
+        }
+
+        try {
+            if (!doPaint)
+                return;
+
+            if (!repeatX && !repeatY) {
+                state.drawBitmap(bitmap, src, drawDst, paint);
+                return;
             }
 
-            if (doPaint) {
-                Rect src = new Rect(0, 0, bitmap.getWidth(), bitmap.getHeight());
-                if (_backgroundX.mode == Mode.Absolute && _backgroundX.size == 0
-                        && _backgroundY.mode == Mode.Absolute && _backgroundY.size == 0) {
-                    float wx = 1.0f * dst.width() / src.width();
-                    float hx = 1.0f * dst.height() / src.height();
-                    float x = Math.max(wx, hx);
-                    int scaledWidth = Math.round(src.width() * x);
-                    int scaledHeight = Math.round(src.height() * x);
-                    int dx = dst.width() - scaledWidth;
-                    int dy = dst.height() - scaledHeight;
-                    dst.left += dx / 2;
-                    dst.top += dy / 2;
-                    dst.right = dst.left + scaledWidth;
-                    dst.bottom = dst.top + scaledHeight;
-                    state.drawBitmap(bitmap, src, dst, paint);
-                } else {
-                    _backgroundX.merge(_backgroundY, dst, src);
-                    state.drawBitmap(bitmap, src, dst, paint);
+            int tileW = drawDst.width();
+            int tileH = drawDst.height();
+            if (tileW <= 0 || tileH <= 0) {
+                Log.w(TAG, "invalid tile size: " + drawDst);
+                return;
+            }
+
+            int startX = repeatX ? dst.left : drawDst.left;
+            int startY = repeatY ? dst.top : drawDst.top;
+            int endX = repeatX ? dst.right : drawDst.right;
+            int endY = repeatY ? dst.bottom : drawDst.bottom;
+
+            for (int y = startY; y < endY; y += tileH) {
+                for (int x = startX; x < endX; x += tileW) {
+                    Rect tileDst = new Rect(x, y, x + tileW, y + tileH);
+                    state.drawBitmap(bitmap, src, tileDst, paint);
+                    if (!repeatX) break;
                 }
+                if (!repeatY) break;
             }
-
+        } finally {
             if (clip)
                 state.restore();
         }

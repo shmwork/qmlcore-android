@@ -111,11 +111,11 @@ public final class ImageLoader {
             }
         }
 
-        void onImageLoaded(URI uri, Bitmap bitmap) {
+        private LinkedList<ImageLoadedCallback> snapshot() {
             LinkedList<ImageLoadedCallback> callbacks = new LinkedList<>();
             synchronized (_callbacks) {
                 Iterator<WeakReference<ImageLoadedCallback>> it = _callbacks.iterator();
-                while(it.hasNext()) {
+                while (it.hasNext()) {
                     ImageLoadedCallback el = it.next().get();
                     if (el != null) {
                         callbacks.push(el);
@@ -123,7 +123,11 @@ public final class ImageLoader {
                         it.remove();
                 }
             }
-            for(ImageLoadedCallback callback : callbacks) {
+            return callbacks;
+        }
+
+        void onImageLoaded(URI uri, Bitmap bitmap) {
+            for (ImageLoadedCallback callback : snapshot()) {
                 try {
                     callback.onImageLoaded(uri, bitmap);
                 } catch (Exception ex) {
@@ -131,7 +135,17 @@ public final class ImageLoader {
                 }
             }
         }
-    };
+
+        void onImageLoadFailed(URI uri, Throwable error) {
+            for (ImageLoadedCallback callback : snapshot()) {
+                try {
+                    callback.onImageLoadFailed(uri, error);
+                } catch (Exception ex) {
+                    Log.w(TAG, "onImageLoadFailed " + uri + " failed", ex);
+                }
+            }
+        }
+    }
 
     private CallbackHolder getCallbackHolder(URI url) {
         synchronized (_callbacks) {
@@ -208,25 +222,33 @@ public final class ImageLoader {
         @Override
         public void doRun() {
             Log.i(TAG, "starting loading task on " + _url);
+            Bitmap bitmap = null;
+            Throwable error = null;
             try {
                 InputStream rawStream;
                 if (_url.getScheme().equals("file")) {
                     String path = _url.getPath();
                     int pos = 0;
-                    while(pos < path.length() && path.charAt(pos) == '/')
+                    while (pos < path.length() && path.charAt(pos) == '/')
                         ++pos;
-                    rawStream = _env.getAssets().open(path.substring(pos)); //strip leading slash
-                } else
+                    rawStream = _env.getAssets().open(path.substring(pos));
+                } else {
                     rawStream = _url.toURL().openStream();
+                }
+
                 try {
                     _holder.load(rawStream);
+                    bitmap = _holder.getBitmap();
+                    if (bitmap == null) {
+                        error = new RuntimeException("decoded bitmap is null");
+                    }
                 } finally {
                     rawStream.close();
                 }
-            } catch(Exception ex) {
+            } catch (Exception ex) {
                 Log.e(TAG, "image loading failed", ex);
+                error = ex;
             } finally {
-                Bitmap bitmap;
                 _holder.finish();
                 bitmap = getNotifyBitmap();
 
@@ -236,12 +258,22 @@ public final class ImageLoader {
                 }
 
                 synchronized (_cache) {
-                    _cache.put(_url, _holder);
+                    // Failed decodes must not occupy LRU: a cached null holder
+                    // never fires the error callback again after ListView reuse.
+                    if (bitmap != null)
+                        _cache.put(_url, _holder);
                 }
 
                 CallbackHolder callbacks = getCallbackHolder(_url);
-                if (callbacks != null)
-                    callbacks.onImageLoaded(_url, bitmap);
+                if (callbacks != null) {
+                    if (bitmap != null) {
+                        callbacks.onImageLoaded(_url, bitmap);
+                    } else {
+                        if (error == null)
+                            error = new RuntimeException("decoded bitmap is null");
+                        callbacks.onImageLoadFailed(_url, error);
+                    }
+                }
                 Log.v(TAG, "cache size: " + _cache.size());
             }
             Log.i(TAG, "finished loading task on " + _url);
