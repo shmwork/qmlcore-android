@@ -16,6 +16,7 @@ import android.graphics.Rect;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.KeyEvent;
@@ -51,6 +52,12 @@ public final class MainActivity
     boolean                         _keyDownHandled;
     boolean                         _showSoftKeyboard;
     InputMethodManager              _imm;
+    private boolean _isResumed = false;
+    private boolean _isSurfaceReady = false;
+    // One physical Back may arrive via KeyEvent and OnBackPressedCallback; keep a single gated handler.
+    private static final long BACK_DEBOUNCE_MS = 100;
+    private long _lastBackUptimeMs;
+    private boolean _lastBackResult;
 
     private final ServiceConnection _executionEnvironmentConnection = new ServiceConnection() {
         public void onServiceConnected(ComponentName className, IBinder service) {
@@ -180,16 +187,20 @@ public final class MainActivity
                     public void closeApp() {
                         finish();
                     }
+                    @Override
+                    public void moveTaskToBack() {
+                        MainActivity.this.moveTaskToBack(true);
+                    }
                 };
+                _isSurfaceReady = true;
+                _surfaceFrame = holder.getSurfaceFrame();
                 if (_executionEnvironment != null) {
                     _executionEnvironment.setSurfaceHolder(holder);
-                    Rect frame = holder.getSurfaceFrame();
-                    if (frame != null) {
-                        _surfaceFrame = frame;
-                        _executionEnvironment.setSurfaceFrame(frame);
+                    if (_surfaceFrame != null) {
+                        _executionEnvironment.setSurfaceFrame(_surfaceFrame);
                     }
-                    _executionEnvironment.setRenderer(_uiRenderer);
                 }
+                syncLifecycle();
             }
         }
 
@@ -275,7 +286,7 @@ public final class MainActivity
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
             public void handleOnBackPressed() {
-                if (!processBack())
+                if (!handleBackPress())
                     finish();
             }
         });
@@ -321,6 +332,8 @@ public final class MainActivity
                     _keyDownHandled = true;
                     _showSoftKeyboard = true;
                     _executionEnvironment.blockUiInput(true);
+                } else if ("Back".equals(keyName)) {
+                    _keyDownHandled = handleBackPress();
                 } else if (_executionEnvironment != null) {
                     try {
                         _keyDownHandled = _executionEnvironment.sendEvent(keyName, event).get();
@@ -350,8 +363,22 @@ public final class MainActivity
         return super.dispatchKeyEvent(event);
     }
 
+    private boolean handleBackPress() {
+        long now = SystemClock.uptimeMillis();
+        if (_lastBackUptimeMs != 0 && now - _lastBackUptimeMs < BACK_DEBOUNCE_MS) {
+            Log.d(TAG, "duplicate back ignored, result=" + _lastBackResult);
+            return _lastBackResult;
+        }
+        _lastBackUptimeMs = now;
+        _lastBackResult = processBack();
+        return _lastBackResult;
+    }
+
     private boolean processBack() {
         try {
+            if (_executionEnvironment == null)
+                return false;
+
             ExecutorService executor = _executionEnvironment.getExecutor();
             if (executor == null)
                 return false;
@@ -369,38 +396,55 @@ public final class MainActivity
         return false;
     }
 
+    private void syncLifecycle() {
+        if (_executionEnvironment == null) return;
+        if (_isResumed && _isSurfaceReady) {
+            _executionEnvironment.acquireResource();
+            _executionEnvironment.resume();
+            _executionEnvironment.setRenderer(_uiRenderer);
+            synchronized (MainActivity.this) {
+                if (_executionEnvironment != null) {
+                    _executionEnvironment.update(_executionEnvironment.getRootElement());
+                    _executionEnvironment.paint();
+                }
+            }
+        } else {
+            _executionEnvironment.pause();
+        }
+    }
+
     @Override
     protected void onStop() {
         super.onStop();
         Log.i(TAG, "stopping main activity...");
         if (_executionEnvironment != null) {
             _executionEnvironment.releaseResource();
-			_executionEnvironment.pause();
-		}
+            _executionEnvironment.pause();
+        }
     }
 
-	@Override
-	protected void onUserLeaveHint() {
-		super.onUserLeaveHint();
-		Log.i(TAG, "onUserLeaveHint");
-		if (_executionEnvironment != null)
-			_executionEnvironment.pause(); 
-	}
+    @Override
+    protected void onUserLeaveHint() {
+        super.onUserLeaveHint();
+        Log.i(TAG, "onUserLeaveHint");
+        _isResumed = false;
+        syncLifecycle();
+    }
 
     @Override
     protected void onPause() {
         super.onPause();
         Log.i(TAG, "onPause");
-        if (_executionEnvironment != null)
-            _executionEnvironment.pause();
+        _isResumed = false;
+        syncLifecycle();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         Log.i(TAG, "onResume");
-        if (_executionEnvironment != null)
-            _executionEnvironment.resume();
+        _isResumed = true;
+        syncLifecycle();
     }
 
     @Override
@@ -418,6 +462,12 @@ public final class MainActivity
             unbindService(_executionEnvironmentConnection);
         _mainView = null;
         super.onDestroy();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        Log.i(TAG, "onNewIntent");
     }
 
     @Override

@@ -173,6 +173,27 @@ public final class PaintState {
         addDirtyRect(rect.left - sw, rect.top - sw, rect.right + sw, rect.bottom + sw);
     }
 
+    public void drawRoundRect(final Rect rect, float[] radii, Paint paint) {
+        float sw = paint.getStrokeWidth();
+        RectF dst = new RectF(rect);
+        dst.offset(-cacheX, -cacheY);
+        Path path = new Path();
+        path.addRoundRect(dst, radii, Path.Direction.CW);
+        canvas.drawPath(path, paint);
+        dst.offset(cacheX, cacheY);
+        addDirtyRect(dst.left - sw, dst.top - sw, dst.right + sw, dst.bottom + sw);
+    }
+
+    public void drawRoundRect(RectF rect, float[] radii, Paint paint) {
+        float sw = paint.getStrokeWidth();
+        rect.offset(-cacheX, -cacheY);
+        Path path = new Path();
+        path.addRoundRect(rect, radii, Path.Direction.CW);
+        canvas.drawPath(path, paint);
+        rect.offset(cacheX, cacheY);
+        addDirtyRect(rect.left - sw, rect.top - sw, rect.right + sw, rect.bottom + sw);
+    }
+
     public void drawRect(Rect rect, Paint paint) {
         rect.offset(-cacheX, -cacheY);
         canvas.drawRect(new RectF(rect), paint);

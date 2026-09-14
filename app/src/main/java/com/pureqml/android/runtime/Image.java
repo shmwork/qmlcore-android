@@ -21,13 +21,12 @@ import com.pureqml.android.TypeConverter;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.concurrent.Executor;
-import java.util.HashMap;
-import java.util.Map;
 
 public final class Image extends Element implements ImageLoadedCallback {
     private final static String TAG = "rt.Image";
     URI                         _url;
     V8Function                  _callback;
+    boolean                     _loadRequested;
     final Paint                 _paint;
 
     private enum Position { LeftOrTop, Center, RightOrBottom }
@@ -42,46 +41,6 @@ public final class Image extends Element implements ImageLoadedCallback {
             default:
                 return 0;
         }
-    }
-
-    @Override
-    public void onImageLoadFailed(final URI url, final Throwable error) {
-        Executor executor = _env.getExecutor();
-        if (executor == null) {
-            Log.d(TAG, "skipping error callback, executor is dead");
-            return;
-        }
-
-        executor.execute(new SafeRunnable() {
-            @Override
-            public void doRun() {
-                Log.w(TAG, "image load failed " + url, error);
-
-                final V8Function callback;
-                synchronized (_callbacks) {
-                    callback = _callbacks.remove(url);
-                }
-
-                if (callback == null || callback.isReleased()) {
-                    return;
-                }
-
-                try (V8Array args = new V8Array(_env.getRuntime())) {
-                    args.push((Object) null);
-                    Object r = callback.call(null, args);
-                    if (r instanceof Releasable) {
-                        ((Releasable) r).release();
-                    }
-                } catch (Exception ex) {
-                    Log.w(TAG, "error callback failed", ex);
-                } finally {
-                    if (!callback.isReleased()) {
-                        callback.close();
-                    }
-                    update();
-                }
-            }
-        });
     }
 
     private final class Background {
@@ -229,6 +188,13 @@ public final class Image extends Element implements ImageLoadedCallback {
         _paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.SRC_OVER));
     }
 
+    private void setCallback(final V8Function callback) {
+        if (_callback != null) {
+            _callback.close();
+        }
+        _callback = callback;
+    }
+
     @Override
     public void discard() {
         super.discard();
@@ -236,7 +202,45 @@ public final class Image extends Element implements ImageLoadedCallback {
             _env.getImageLoader().unsubscribe(_url, this);
             _url = null;
         }
+        _loadRequested = false;
         setCallback(null);
+    }
+
+    private void invokeLoadCallback(Bitmap bitmap) {
+        if (_callback == null)
+            return;
+
+        if (_callback.isReleased()) {
+            setCallback(null);
+            update();
+            return;
+        }
+
+        try (V8Array args = new V8Array(_env.getRuntime())) {
+            if (bitmap != null) {
+                V8Object metrics = new V8Object(_env.getRuntime());
+                metrics.add("width", bitmap.getWidth());
+                metrics.add("height", bitmap.getHeight());
+                args.push(metrics);
+
+                try {
+                    _env.invokeVoidCallback(_callback, null, args);
+                } catch (Exception ex) {
+                    Log.w(TAG, "callback failed: ", ex);
+                }
+                metrics.close();
+            } else {
+                args.push((Object) null);
+                try {
+                    _env.invokeVoidCallback(_callback, null, args);
+                } catch (Exception ex) {
+                    Log.w(TAG, "callback failed: ", ex);
+                }
+            }
+            setCallback(null);
+        } finally {
+            update();
+        }
     }
 
     public void load(String name, final V8Function callback) {
@@ -262,6 +266,7 @@ public final class Image extends Element implements ImageLoadedCallback {
             _url = new URI(name);
         } catch (URISyntaxException e) {
             Log.e(TAG, "invalid url", e);
+            _loadRequested = false;
             V8 v8 = _env.getRuntime();
 
             V8Array args = new V8Array(v8);
@@ -275,6 +280,18 @@ public final class Image extends Element implements ImageLoadedCallback {
         }
         // Log.v(TAG, "loading " + _url);
         setCallback(callback);
+
+        // Cache hits must be applied on the script thread immediately. Re-queueing through
+        // the executor (as onImageLoaded used to) postpones background-size by a frame and
+        // shows an empty/black rect while scrolling ListViews — even for local assets.
+        Bitmap cached = loader.peekBitmap(_url);
+        if (cached != null) {
+            _loadRequested = false;
+            invokeLoadCallback(cached);
+            return;
+        }
+
+        _loadRequested = true;
         loader.subscribe(_url, this);
     }
 
@@ -372,38 +389,35 @@ public final class Image extends Element implements ImageLoadedCallback {
             @Override
             public void doRun() {
                 Log.v(TAG, "on image loaded " + url + ", current url: " + _url);
-
-                final V8Function callback;
-                synchronized (_callbacks) {
-                    callback = _callbacks.get(url);
-                }
-
-                if (callback == null || callback.isReleased()) {
+                if (_url == null || !_url.equals(url)) {
                     return;
                 }
 
-                try (V8Array args = new V8Array(_env.getRuntime())) {
-                    if (bitmap != null) {
-                        V8Object metrics = new V8Object(_env.getRuntime());
-                        metrics.add("width", bitmap.getWidth());
-                        metrics.add("height", bitmap.getHeight());
-                        args.push(metrics);
-                        metrics.close();
-                    } else {
-                        args.push((Object) null); // <-- Отдаём null для ошибки
-                    }
+                Log.v(TAG, "image bitmap: " + _url + " -> " + bitmap);
+                _loadRequested = false;
+                invokeLoadCallback(bitmap);
+            }
+        });
+    }
 
-                    try {
-                        _env.invokeVoidCallback(callback, null, args);
-                    } catch (Exception ex) {
-                        Log.w(TAG, "callback failed: ", ex);
-                    }
-                } finally {
-                    if (!callback.isReleased()) {
-                        callback.close();
-                    }
-                    update(); // <-- Принудительно обновляем состояние
+    @Override
+    public void onImageLoadFailed(final URI url, final Throwable error) {
+        Executor executor = _env.getExecutor();
+        if (executor == null) {
+            Log.d(TAG, "skipping error callback, executor is dead");
+            return;
+        }
+
+        executor.execute(new SafeRunnable() {
+            @Override
+            public void doRun() {
+                Log.w(TAG, "image load failed " + url, error);
+                if (_url == null || !_url.equals(url)) {
+                    return;
                 }
+                // Leave _loadRequested set so paint will not start another decode
+                // until load() runs again (source change / explicit reload).
+                invokeLoadCallback(null);
             }
         });
     }
@@ -418,58 +432,79 @@ public final class Image extends Element implements ImageLoadedCallback {
             state.drawRect(dst, bg);
         }
 
-        if (_url == null) {
+        if (_url == null)
             return;
-        }
 
-        Bitmap bitmap = null;
-        try {
-            bitmap = _env.getImageLoader().getBitmap(_url);
-        } catch (Exception ex) {
-            Log.w(TAG, "image loading failed", ex);
-        }
-
+        ImageLoader loader = _env.getImageLoader();
+        Bitmap bitmap = loader.peekBitmap(_url);
         if (bitmap == null) {
-            Paint bg = new Paint();
-            bg.setColor(_backgroundColor);
-            state.drawRect(dst, bg);
+            // Restores old getBitmap()-in-paint reload behaviour when LRU evicts a visible url,
+            // without getHolder() pinning every painted frame in cache.
+            if (!_loadRequested && _callback == null) {
+                _loadRequested = true;
+                loader.subscribe(_url, this);
+            }
             return;
         }
 
         _paint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.SRC_OVER));
         Paint paint = patchAlpha(_paint, 255, state.opacity);
-        if (paint == null) {
+        if (paint == null)
+            return;
+
+        Rect src = new Rect(0, 0, bitmap.getWidth(), bitmap.getHeight());
+
+        // Default Absolute size is 0 until QML applies background-size. Cover-scale
+        // avoids a black/empty frame when the bitmap is already available.
+        if (_backgroundX.mode == Mode.Absolute && _backgroundX.size == 0
+                && _backgroundY.mode == Mode.Absolute && _backgroundY.size == 0) {
+            float wx = 1.0f * dst.width() / src.width();
+            float hx = 1.0f * dst.height() / src.height();
+            float x = Math.max(wx, hx);
+            int scaledWidth = Math.round(src.width() * x);
+            int scaledHeight = Math.round(src.height() * x);
+            int dx = dst.width() - scaledWidth;
+            int dy = dst.height() - scaledHeight;
+            Rect scaled = new Rect(dst);
+            scaled.left += dx / 2;
+            scaled.top += dy / 2;
+            scaled.right = scaled.left + scaledWidth;
+            scaled.bottom = scaled.top + scaledHeight;
+            state.drawBitmap(bitmap, src, scaled, paint);
             return;
         }
 
-        Rect src = new Rect(0, 0, bitmap.getWidth(), bitmap.getHeight());
         Rect drawDst = new Rect(dst);
         _backgroundX.merge(_backgroundY, drawDst, src);
 
         boolean repeatX = _backgroundX.repeat;
         boolean repeatY = _backgroundY.repeat;
-
-        if (!repeatX && !repeatY) {
-            state.drawBitmap(bitmap, src, drawDst, paint);
-            return;
+        boolean clip = _backgroundX.needClip(_backgroundY);
+        boolean doPaint = true;
+        if (clip) {
+            state.save();
+            if (!state.clipRect(dst))
+                doPaint = false;
         }
 
-        int tileW = drawDst.width();
-        int tileH = drawDst.height();
-        if (tileW <= 0 || tileH <= 0) {
-            Log.w(TAG, "invalid tile size: " + drawDst);
-            return;
-        }
-
-        state.save();
         try {
-            if (!state.clipRect(dst)) {
+            if (!doPaint)
+                return;
+
+            if (!repeatX && !repeatY) {
+                state.drawBitmap(bitmap, src, drawDst, paint);
+                return;
+            }
+
+            int tileW = drawDst.width();
+            int tileH = drawDst.height();
+            if (tileW <= 0 || tileH <= 0) {
+                Log.w(TAG, "invalid tile size: " + drawDst);
                 return;
             }
 
             int startX = repeatX ? dst.left : drawDst.left;
             int startY = repeatY ? dst.top : drawDst.top;
-
             int endX = repeatX ? dst.right : drawDst.right;
             int endY = repeatY ? dst.bottom : drawDst.bottom;
 
@@ -482,7 +517,8 @@ public final class Image extends Element implements ImageLoadedCallback {
                 if (!repeatY) break;
             }
         } finally {
-            state.restore();
+            if (clip)
+                state.restore();
         }
     }
 }

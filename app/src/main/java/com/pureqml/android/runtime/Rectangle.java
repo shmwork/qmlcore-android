@@ -3,6 +3,7 @@ package com.pureqml.android.runtime;
 import android.graphics.Color;
 import android.graphics.LinearGradient;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.PorterDuff;
 import android.graphics.PorterDuffXfermode;
 import android.graphics.Rect;
@@ -138,7 +139,7 @@ public final class Rectangle extends Element {
         update();
     }
 
-    private void unionWithBorder(Rect rect) {
+    protected void adjustRect(Rect rect) {
         if (_outerBorder && _borderWidth > 0) {
             int width = (int)Math.ceil(_borderWidth);
             int inset = -width;
@@ -152,20 +153,34 @@ public final class Rectangle extends Element {
             return super.createRedrawRect();
 
         Rect rect = getScreenRect();
-        if (_outerBorder && _borderWidth > 0) {
-            int width = (int)Math.ceil(_borderWidth);
-            rect.offset(width, width);
-        }
-
-        unionWithBorder(rect);
+        adjustRect(rect);
         return rect;
     }
 
     @Override
     protected PaintState createChildrenPaintState(PaintState state) {
-        int bw = (int)_borderWidth;
+        float bw = _borderWidth;
         if (bw > 0) {
-            return new PaintState(state, bw, bw, 1.0f);
+            if (hasRoundCorners() && getClip()) {
+                Path path = new Path();
+                Rect rect = getRect();
+                RectF clip = new RectF(
+                        state.baseX + bw,
+                        state.baseY + bw,
+                        state.baseX + rect.width() - bw,
+                        state.baseY + rect.height() - bw
+                );
+                float[] radii = getCornerRadii(bw / 2.0f);
+                if (radii != null)
+                    path.addRoundRect(clip, radii, Path.Direction.CW);
+                else
+                    path.addRect(clip, Path.Direction.CW);
+                if (!state.clipPath(path))
+                    return state;
+            }
+
+            int offset = (int)bw;
+            return new PaintState(state, offset, offset, 1.0f);
         } else
             return state;
     }
@@ -195,8 +210,11 @@ public final class Rectangle extends Element {
 
             Paint paint = patchAlpha(_background, Color.alpha(_color), opacity);
             if (paint != null) {
-                if (_radius > 0) {
-                    state.drawRoundRect(rect, _radius, _radius, paint);
+                if (hasRoundCorners()) {
+                    if (isUniformRadius())
+                        state.drawRoundRect(rect, _radiusTl, _radiusTl, paint);
+                    else
+                        state.drawRoundRect(rect, getCornerRadii(), paint);
                 } else {
                     state.drawRect(rect, paint);
                 }
@@ -211,8 +229,11 @@ public final class Rectangle extends Element {
                 inset -= _borderWidth;
             borderRect.inset(inset, inset);
             if (paint != null) {
-                if (_radius > 0) {
-                    state.drawRoundRect(borderRect, _radius, _radius, paint);
+                if (hasRoundCorners()) {
+                    if (isUniformRadius())
+                        state.drawRoundRect(borderRect, _radiusTl, _radiusTl, paint);
+                    else
+                        state.drawRoundRect(borderRect, getCornerRadii(), paint);
                 } else {
                     state.drawRect(borderRect, paint);
                 }

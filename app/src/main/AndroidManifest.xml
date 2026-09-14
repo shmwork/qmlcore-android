@@ -36,7 +36,12 @@
         android:enableOnBackInvokedCallback="true"
         tools:ignore="UnusedAttribute">
 
-        <activity android:name=".MainActivity" android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|uiMode|density|screenLayout|smallestScreenSize" android:theme="@style/AppTheme.NoTitleBar" android:exported="true">
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboard|keyboardHidden|navigation|uiMode|density|screenLayout|smallestScreenSize"
+            android:theme="@style/AppTheme.NoTitleBar" android:exported="true"
+            android:launchMode="singleTask"
+        >
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
