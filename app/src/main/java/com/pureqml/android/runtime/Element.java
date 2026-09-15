@@ -635,113 +635,160 @@ public class Element extends BaseObject {
         return _rect.top + (_translate != null? _translate.y: 0);
     }
 
+    /**
+     * CSS/web stacking: z=0 is z-index:auto (not a stacking context).
+     * Positive-z descendants are painted in the nearest stacking context
+     * (root or an ancestor with z != 0), so KeyboardModul (z=10) inside a
+     * page covers Menu (z=5) the same way as in the browser.
+     */
+    private static final class StackedPaint {
+        final Element parent;
+        final Element child;
+        final PaintState parentState;
+
+        StackedPaint(Element parent, Element child, PaintState parentState) {
+            this.parent = parent;
+            this.child = child;
+            this.parentState = parentState;
+        }
+    }
+
     @SuppressWarnings("unchecked")
-    private void paintChildren(PaintState parent) {
+    private void paintChildren(PaintState parent, ArrayList<StackedPaint> stacked) {
         if (_children == null)
             return;
 
         final ArrayList<Element> children = (ArrayList<Element>)_children.clone();
+        for (Element child : children)
+            paintOneChild(child, parent, stacked);
+    }
+
+    private void paintOneChild(Element child, PaintState parent, ArrayList<StackedPaint> stacked) {
         int scrollX = -getScrollXImpl(), scrollY = -getScrollYImpl();
+        float opacity = child._opacity * parent.opacity;
+        if (!child._visible || !PaintState.visible(opacity)) {
+            child._lastRect.setEmpty();
+            child._combinedRect.setEmpty();
+            return;
+        }
 
-        for (Element child : children) {
-            float opacity = child._opacity * parent.opacity;
-            if (!child._visible || !PaintState.visible(opacity)) {
-                child._lastRect.setEmpty();
-                child._combinedRect.setEmpty();
-                continue;
-            }
+        Rect childRect = child.getRect();
+        int childX = scrollX + child.getBaseX(), childY = scrollY + child.getBaseY();
+        childRect.offsetTo(parent.baseX + childX, parent.baseY + childY);
+        int childWidth = childRect.width(), childHeight = childRect.height();
+        boolean cache = child._cache;
+        boolean fitParentRect = childRect.contains(_rect);
 
-            Rect childRect = child.getRect();
-            int childX = scrollX + child.getBaseX(), childY = scrollY + child.getBaseY();
-            childRect.offsetTo(parent.baseX + childX, parent.baseY + childY);
-            int childWidth = childRect.width(), childHeight = childRect.height();
-            boolean cache = child._cache;
-            boolean fitParentRect = childRect.contains(_rect);
-
-
-            if (!child._cacheValid) {
-                PaintState state;
-                if (cache) {
-                    if (child._cachePicture == null)
-                        child._cachePicture = new Picture();
-                    state = new PaintState(child._cachePicture, parent, childX, childY, childWidth, childHeight, opacity);
-                } else {
-                    state = new PaintState(parent, childX, childY, opacity);
-                }
-
-                final boolean clip = child._clip && !cache; //fixme: disable clipping when caching (should be implicit)
-                boolean paint = true;
-                boolean saveCanvasState = clip || _scale != null || _rotate != 0;
-                int canvasRestorePoint;
-
-                if (saveCanvasState)
-                    canvasRestorePoint = state.save();
-                else
-                    canvasRestorePoint = -1;
-
-                try {
-
-                    if (_scale != null) {
-                        //Log.v(TAG, "adjusting scale to " + _scale);
-                        state.scale(_scale.x, _scale.y, state.baseX + childWidth / 2.0f, state.baseY + childHeight / 2.0f);
-                    }
-
-                    if (_rotate != 0) {
-                        state.rotate(_rotate, state.baseX + childWidth / 2.0f, state.baseY + childHeight / 2.0f);
-                    }
-
-                    if (clip) {
-                        if (fitParentRect && roundClippingNeeded()) {
-                            Path path = new Path();
-                            addRoundClipPath(path, this, state.baseX, state.baseY, state.baseX + childWidth, state.baseY + childHeight);
-                            if (!state.clipPath(path))
-                                paint = false;
-                        } else if (child.roundClippingNeeded()) {
-                            Path path = new Path();
-                            addRoundClipPath(path, child, state.baseX, state.baseY, state.baseX + childWidth, state.baseY + childHeight);
-                            if (!state.clipPath(path))
-                                paint = false;
-                        } else {
-                            if (!state.clipRect(childRect))
-                                paint = false;
-                        }
-                    }
-
-                    if (paint) {
-                        child.paint(state);
-                    }
-
-                } catch (Exception ex) {
-                    Log.w(TAG, "paint", ex);
-                }
-                if (saveCanvasState) {
-                    state.restoreToCount(canvasRestorePoint);
-                }
-                if (cache) {
-                    state.end();
-                    child._cacheValid = true;
-                }
-            }
-
-            if (child._cacheValid) {
-                parent.drawPicture(child._cachePicture, parent.baseX + childX, parent.baseY + childY);
-            }
-
+        if (stacked != null && child._z > 0 && !cache) {
+            stacked.add(new StackedPaint(this, child, parent));
             child._combinedRect.union(childRect);
             _combinedRect.union(child._combinedRect);
             _lastRect.union(child._lastRect);
+            return;
         }
+
+        if (!child._cacheValid) {
+            PaintState state;
+            if (cache) {
+                if (child._cachePicture == null)
+                    child._cachePicture = new Picture();
+                state = new PaintState(child._cachePicture, parent, childX, childY, childWidth, childHeight, opacity);
+            } else {
+                state = new PaintState(parent, childX, childY, opacity);
+            }
+
+            final boolean clip = child._clip && !cache; //fixme: disable clipping when caching (should be implicit)
+            boolean paint = true;
+            boolean saveCanvasState = clip || _scale != null || _rotate != 0;
+            int canvasRestorePoint;
+
+            if (saveCanvasState)
+                canvasRestorePoint = state.save();
+            else
+                canvasRestorePoint = -1;
+
+            try {
+
+                if (_scale != null) {
+                    //Log.v(TAG, "adjusting scale to " + _scale);
+                    state.scale(_scale.x, _scale.y, state.baseX + childWidth / 2.0f, state.baseY + childHeight / 2.0f);
+                }
+
+                if (_rotate != 0) {
+                    state.rotate(_rotate, state.baseX + childWidth / 2.0f, state.baseY + childHeight / 2.0f);
+                }
+
+                if (clip) {
+                    if (fitParentRect && roundClippingNeeded()) {
+                        Path path = new Path();
+                        addRoundClipPath(path, this, state.baseX, state.baseY, state.baseX + childWidth, state.baseY + childHeight);
+                        if (!state.clipPath(path))
+                            paint = false;
+                    } else if (child.roundClippingNeeded()) {
+                        Path path = new Path();
+                        addRoundClipPath(path, child, state.baseX, state.baseY, state.baseX + childWidth, state.baseY + childHeight);
+                        if (!state.clipPath(path))
+                            paint = false;
+                    } else {
+                        if (!state.clipRect(childRect))
+                            paint = false;
+                    }
+                }
+
+                if (paint) {
+                    ArrayList<StackedPaint> childStacked = (child._z == 0) ? stacked : null;
+                    child.paintInternal(state, childStacked);
+                }
+
+            } catch (Exception ex) {
+                Log.w(TAG, "paint", ex);
+            }
+            if (saveCanvasState) {
+                state.restoreToCount(canvasRestorePoint);
+            }
+            if (cache) {
+                state.end();
+                child._cacheValid = true;
+            }
+        }
+
+        if (child._cacheValid) {
+            parent.drawPicture(child._cachePicture, parent.baseX + childX, parent.baseY + childY);
+        }
+
+        child._combinedRect.union(childRect);
+        _combinedRect.union(child._combinedRect);
+        _lastRect.union(child._lastRect);
     }
+
+    private static void paintStackedLayers(ArrayList<StackedPaint> stacked) {
+        if (stacked == null || stacked.isEmpty())
+            return;
+        Collections.sort(stacked, (a, b) -> Integer.compare(a.child._z, b.child._z));
+        for (StackedPaint layer : stacked)
+            layer.parent.paintOneChild(layer.child, layer.parentState, null);
+    }
+
     protected void paintElementSpecificBeforeChildren(PaintState state) {}
     protected void paintElementSpecificAfterChildren(PaintState state) {}
     protected PaintState createChildrenPaintState(PaintState state) { return state; }
 
-    public final void paint(PaintState state) {
+    private void paintInternal(PaintState state, ArrayList<StackedPaint> stacked) {
         beginPaint(state);
         paintElementSpecificBeforeChildren(state);
-        paintChildren(createChildrenPaintState(state));
+        paintChildren(createChildrenPaintState(state), stacked);
         paintElementSpecificAfterChildren(state);
         endPaint(state);
+    }
+
+    public final void paint(PaintState state) {
+        if (_parent == null) {
+            ArrayList<StackedPaint> stacked = new ArrayList<>();
+            paintInternal(state, stacked);
+            paintStackedLayers(stacked);
+        } else {
+            paintInternal(state, null);
+        }
     }
 
     protected final Rect getScreenRect() {
@@ -765,6 +812,53 @@ public class Element extends BaseObject {
         update();
     }
 
+    private void collectPositiveZ(ArrayList<Element> children, ArrayList<Element> out) {
+        for (Element child : children) {
+            if (!child._visible || !child._globallyVisible)
+                continue;
+            if (child._z > 0)
+                out.add(child);
+            else if (child._z == 0 && child._children != null)
+                collectPositiveZ(child._children, out);
+        }
+    }
+
+    private static Element childOnPath(Element ancestor, Element descendant) {
+        Element current = descendant;
+        while (current != null && current._parent != ancestor)
+            current = current._parent;
+        return current;
+    }
+
+    private boolean sendEventToDescendant(Element descendant, int eventId, int x, int y, MotionEvent event) {
+        int cx = x - getBaseX();
+        int cy = y - getBaseY();
+        if (_clip) {
+            Rect r = getRect();
+            if (cx < 0 || cy < 0 || cx > r.width() || cy > r.height())
+                return false;
+        }
+        if (descendant._parent == this)
+            return descendant.sendEvent(eventId, cx, cy, event);
+
+        Element current = childOnPath(this, descendant);
+        while (current != null && current != descendant) {
+            cx += current.getScrollXImpl();
+            cy += current.getScrollYImpl();
+            int ox = cx - current.getBaseX();
+            int oy = cy - current.getBaseY();
+            if (current._clip) {
+                Rect r = current.getRect();
+                if (ox < 0 || oy < 0 || ox > r.width() || oy > r.height())
+                    return false;
+            }
+            current = childOnPath(current, descendant);
+            cx = ox;
+            cy = oy;
+        }
+        return current == descendant && descendant.sendEvent(eventId, cx, cy, event);
+    }
+
     public boolean sendEvent(int eventId, int x, int y, MotionEvent event) {
         if (!_globallyVisible)
             return false;
@@ -778,16 +872,31 @@ public class Element extends BaseObject {
         y += getScrollYImpl();
 
         if (_children != null && (!_useScrollX && !_useScrollY)) {
-            for (int i = _children.size() - 1; i >= 0; --i) {
-                Element child = _children.get(i);
-                int offsetX = x - getBaseX();
-                int offsetY = y - getBaseY();
-                if (_clip && (offsetX < 0 || offsetY < 0 || offsetX > clientWidth || offsetY > clientHeight))
-                    continue;
+            int offsetX = x - getBaseX();
+            int offsetY = y - getBaseY();
+            boolean insideClip = !_clip || (offsetX >= 0 && offsetY >= 0 && offsetX <= clientWidth && offsetY <= clientHeight);
 
-                if (child.sendEvent(eventId, offsetX, offsetY, event)) {
-                    handled = true;
-                    break;
+            if (insideClip && _parent == null) {
+                ArrayList<Element> stacked = new ArrayList<>();
+                collectPositiveZ(_children, stacked);
+                Collections.sort(stacked, new ZComparator());
+                for (int i = stacked.size() - 1; i >= 0; --i) {
+                    if (sendEventToDescendant(stacked.get(i), eventId, x, y, event)) {
+                        handled = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!handled && insideClip) {
+                for (int i = _children.size() - 1; i >= 0; --i) {
+                    Element child = _children.get(i);
+                    if (_parent == null && child._z > 0)
+                        continue;
+                    if (child.sendEvent(eventId, offsetX, offsetY, event)) {
+                        handled = true;
+                        break;
+                    }
                 }
             }
         }
