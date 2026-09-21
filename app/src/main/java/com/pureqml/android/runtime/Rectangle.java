@@ -90,6 +90,9 @@ public final class Rectangle extends Element {
                 r.left = r.right;
                 r.right = l;
                 break;
+            case "to right":
+                r.bottom = r.top;
+                break;
             default:
                 Log.d(TAG, "unsupported gradient orientation");
         }
@@ -208,7 +211,8 @@ public final class Rectangle extends Element {
             else
                 _background.setShader(null);
 
-            Paint paint = patchAlpha(_background, Color.alpha(_color), opacity);
+            int baseAlpha = _gradientOrientation != null ? 255 : Color.alpha(_color);
+            Paint paint = patchAlpha(_background, baseAlpha, opacity);
             if (paint != null) {
                 if (hasRoundCorners()) {
                     if (isUniformRadius())
