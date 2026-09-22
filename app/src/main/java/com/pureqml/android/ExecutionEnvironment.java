@@ -324,8 +324,11 @@ public final class ExecutionEnvironment extends Service
             }
         }, "getIntentParam");
 
-        v8FD.registerJavaMethod((v8Object, v8Array) -> {
-            HttpRequest.request(ExecutionEnvironment.this, v8Array);
+        v8FD.registerJavaMethod(new JavaCallback() {
+            @Override
+            public Object invoke(V8Object v8Object, V8Array v8Array) {
+                return HttpRequest.request(ExecutionEnvironment.this, v8Array);
+            }
         }, "httpRequest");
 
         v8FD.registerJavaMethod((v8Object, v8Array) -> {
