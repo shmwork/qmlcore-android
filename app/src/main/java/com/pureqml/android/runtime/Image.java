@@ -284,8 +284,18 @@ public final class Image extends Element implements ImageLoadedCallback {
             case "image-rendering":
                 _paint.setFilterBitmap(!value.equals("pixelated"));
                 break;
-            case "background-image":
-                break;
+			case "background-image": {
+				String bg = value == null ? "" : value.toString().trim();
+				if (bg.isEmpty() || bg.equals("none")) {
+					if (_url != null) {
+						_env.getImageLoader().unsubscribe(_url, this);
+						_url = null;
+					}
+					_loadRequested = false;
+					setCallback(null);
+				}
+				break;
+			}
             case "background-position-x":
                 _backgroundX.setPosition(value.toString());
                 break;
