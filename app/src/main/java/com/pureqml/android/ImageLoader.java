@@ -149,15 +149,17 @@ public final class ImageLoader {
         }
     }
 
-    public void subscribe(URI url, ImageLoadedCallback callback) {
-        CallbackHolder callbacks = createCallbackHolder(url);
-        callbacks.subscribe(callback);
-        ImageHolder holder = getHolder(url);
-        Bitmap bitmap = holder.getBitmap();
-        if (bitmap != null) {
-            callbacks.onImageLoaded(url, bitmap);
-        }
-    }
+	public void subscribe(URI url, ImageLoadedCallback callback) {
+		CallbackHolder callbacks = createCallbackHolder(url);
+		callbacks.subscribe(callback);
+
+		ImageHolder holder = getHolder(url);
+
+		if (holder.isFinished()) {
+			callbacks.onImageLoaded(url, holder.getBitmap());
+		}
+	}
+
     public void unsubscribe(URI url, ImageLoadedCallback callback) {
         CallbackHolder holder = getCallbackHolder(url);
         if (holder != null) {
@@ -230,13 +232,13 @@ public final class ImageLoader {
                 _holder.finish();
                 bitmap = getNotifyBitmap();
 
+                synchronized (_cache) {
+                    _cache.put(_url, _holder);
+                }
+
                 synchronized (_loading) {
                     if (_loading.get(_url) == _holder)
                         _loading.remove(_url);
-                }
-
-                synchronized (_cache) {
-                    _cache.put(_url, _holder);
                 }
 
                 CallbackHolder callbacks = getCallbackHolder(_url);
@@ -248,16 +250,14 @@ public final class ImageLoader {
         }
     }
 
-    private interface ImageHolder {
-        void load(InputStream stream);
-        Bitmap getBitmap();
-
-        int byteCount(); //LRUCache API
-
-        void finish();
-
-        void release();
-    }
+	private interface ImageHolder {
+		void load(InputStream stream);
+		Bitmap getBitmap();
+		int byteCount();
+		void finish();
+		boolean isFinished();
+		void release();
+	}
 
     private static abstract class BaseImageHolder implements ImageHolder
     {
@@ -268,6 +268,11 @@ public final class ImageLoader {
         BaseImageHolder(URI url) {
             _url = url;
         }
+
+		@Override
+		public synchronized boolean isFinished() {
+			return _finished;
+		}
 
         @Override
         public void finish() {

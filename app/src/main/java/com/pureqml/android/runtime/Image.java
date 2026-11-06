@@ -187,42 +187,45 @@ public final class Image extends Element implements ImageLoadedCallback {
         setCallback(null);
     }
 
-    private void invokeLoadCallback(Bitmap bitmap) {
-        if (_callback == null)
-            return;
+	private void invokeLoadCallback(Bitmap bitmap) {
+		final V8Function callback = _callback;
+		_callback = null;
 
-        if (_callback.isReleased()) {
-            setCallback(null);
-            update();
-            return;
-        }
+		if (callback == null)
+			return;
 
-        try (V8Array args = new V8Array(_env.getRuntime())) {
-            if (bitmap != null) {
-                V8Object metrics = new V8Object(_env.getRuntime());
-                metrics.add("width", bitmap.getWidth());
-                metrics.add("height", bitmap.getHeight());
-                args.push(metrics);
+		if (callback.isReleased()) {
+			update();
+			return;
+		}
 
-                try {
-                    _env.invokeVoidCallback(_callback, null, args);
-                } catch (Exception ex) {
-                    Log.w(TAG, "callback failed: ", ex);
-                }
-                metrics.close();
-            } else {
-                args.push((Object) null);
-                try {
-                    _env.invokeVoidCallback(_callback, null, args);
-                } catch (Exception ex) {
-                    Log.w(TAG, "callback failed: ", ex);
-                }
-            }
-            setCallback(null);
-        } finally {
-            update();
-        }
-    }
+		V8Object metrics = null;
+
+		try (V8Array args = new V8Array(_env.getRuntime())) {
+			if (bitmap != null) {
+				metrics = new V8Object(_env.getRuntime());
+				metrics.add("width", bitmap.getWidth());
+				metrics.add("height", bitmap.getHeight());
+				args.push(metrics);
+			} else {
+				args.push((Object) null);
+			}
+
+			try {
+				_env.invokeVoidCallback(callback, null, args);
+			} catch (Exception ex) {
+				Log.w(TAG, "callback failed: ", ex);
+			}
+		} finally {
+			if (metrics != null)
+				metrics.close();
+
+			if (!callback.isReleased())
+				callback.close();
+
+			update();
+		}
+	}
 
     public void load(String name, final V8Function callback) {
         if (!name.contains("://"))
