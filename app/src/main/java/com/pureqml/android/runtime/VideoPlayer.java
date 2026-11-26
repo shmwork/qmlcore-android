@@ -6,10 +6,13 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
+import android.media.AudioAttributes;
+import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.text.Layout;
 import android.text.TextPaint;
 import android.util.Log;
 import android.util.TypedValue;
@@ -64,11 +67,24 @@ import com.pureqml.android.IResource;
 import com.pureqml.android.SafeRunnable;
 import com.pureqml.android.TypeConverter;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.lang.ref.WeakReference;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static androidx.media3.common.C.TIME_UNSET;
 
@@ -230,8 +246,12 @@ public final class VideoPlayer extends BaseObject implements IResource {
 
     private static final String TAG = "VideoPlayer";
     private static final int PollingInterval = 500; //ms
+    private static final Object INSTANCES_LOCK = new Object();
+    private static final List<WeakReference<VideoPlayer>> INSTANCES = new ArrayList<>();
+    private static volatile boolean useSystemPlayer = false;
 
     private ExoPlayer player;
+    private SystemMediaPlayerBackend systemPlayer;
     private final SurfaceView           surfaceView;
     private final ViewHolder<?>         viewHolder;
     private final Handler               handler;
@@ -456,8 +476,75 @@ public final class VideoPlayer extends BaseObject implements IResource {
         period = new Timeline.Period();
 
         _env.register(this);
+        synchronized (INSTANCES_LOCK) {
+            INSTANCES.add(new WeakReference<>(this));
+        }
 
         acquireResource();
+    }
+
+    public static void setSoftwareDecoder(boolean enable) {
+        Log.i(TAG, "setSoftwareDecoder useSystemPlayer=" + enable);
+        if (useSystemPlayer == enable)
+            return;
+        useSystemPlayer = enable;
+
+        List<VideoPlayer> players = new ArrayList<>();
+        synchronized (INSTANCES_LOCK) {
+            Iterator<WeakReference<VideoPlayer>> it = INSTANCES.iterator();
+            while (it.hasNext()) {
+                VideoPlayer instance = it.next().get();
+                if (instance == null)
+                    it.remove();
+                else
+                    players.add(instance);
+            }
+        }
+        for (VideoPlayer instance : players)
+            instance.recreateWithCurrentBackend();
+    }
+
+    public static boolean isSoftwareDecoder() {
+        return useSystemPlayer;
+    }
+
+    private void recreateWithCurrentBackend() {
+        handler.post(new SafeRunnable() {
+            @Override
+            protected void doRun() {
+                long positionMs = 0;
+                boolean playWhenReady = autoplay && !paused;
+                if (player != null) {
+                    positionMs = player.getCurrentPosition();
+                    playWhenReady = player.getPlayWhenReady();
+                } else if (systemPlayer != null && systemPlayer.isActive()) {
+                    positionMs = systemPlayer.getCurrentPosition();
+                    playWhenReady = systemPlayer.isPlaying() || playWhenReady;
+                }
+                releaseResourceImpl();
+                paused = !playWhenReady;
+                acquireResourceImpl();
+                final long restorePosition = positionMs;
+                final boolean restorePlayWhenReady = playWhenReady;
+                handler.post(new SafeRunnable() {
+                    @Override
+                    protected void doRun() {
+                        if (player != null) {
+                            if (restorePosition > 0)
+                                player.seekTo(restorePosition);
+                            player.setPlayWhenReady(restorePlayWhenReady);
+                        } else if (systemPlayer != null && systemPlayer.isActive()) {
+                            if (restorePosition > 0)
+                                systemPlayer.seekTo(restorePosition);
+                            if (restorePlayWhenReady)
+                                systemPlayer.play();
+                            else
+                                systemPlayer.pause();
+                        }
+                    }
+                });
+            }
+        });
     }
 
     public void emit(String name, Object ... args) {
@@ -478,6 +565,21 @@ public final class VideoPlayer extends BaseObject implements IResource {
         handler.post(new SafeRunnable() {
             @Override
             public void doRun() {
+                if (systemPlayer != null && systemPlayer.isActive()) {
+                    if (!systemPlayer.isPrepared())
+                        return;
+                    long position = systemPlayer.getCurrentPosition();
+                    long duration = systemPlayer.getDuration();
+                    systemPlayer.updateSubtitleCues(position);
+                    systemPlayer.checkWatchdog(position);
+                    Log.v(TAG, "emitting position " + position + " / " + duration);
+                    VideoPlayer.this.emit("timeupdate", position / 1000.0);
+                    if (duration > 0) {
+                        VideoPlayer.this.emit("durationchange", duration / 1000.0);
+                    }
+                    return;
+                }
+
                 ExoPlayer player = VideoPlayer.this.player;
                 if (player == null)
                     return;
@@ -512,6 +614,10 @@ public final class VideoPlayer extends BaseObject implements IResource {
 
     @OptIn(markerClass = UnstableApi.class)
     private void acquireResourceImpl() {
+        if (useSystemPlayer) {
+            acquireMediaPlayerImpl();
+            return;
+        }
         if (player != null)
             return;
 
@@ -634,6 +740,71 @@ public final class VideoPlayer extends BaseObject implements IResource {
         if (source != null)
             setSource(source);
 
+        startPolling();
+    }
+
+    @OptIn(markerClass = UnstableApi.class)
+    private void acquireMediaPlayerImpl() {
+        if (systemPlayer != null && systemPlayer.isActive())
+            return;
+
+        Log.i(TAG, "creating Android MediaPlayer (NuPlayer)");
+        if (systemPlayer == null) {
+            systemPlayer = new SystemMediaPlayerBackend(_env.getContext(), surfaceView, new SystemMediaPlayerBackend.Callbacks() {
+                @Override
+                public void emit(String name, Object... args) {
+                    VideoPlayer.this.emit(name, args);
+                }
+
+                @Override
+                public void onVideoSize(int width, int height) {
+                    videoWidth = width;
+                    videoHeight = height;
+                    handler.post(new SafeRunnable() {
+                        @Override
+                        protected void doRun() {
+                            updateGeometry();
+                        }
+                    });
+                }
+
+                @Override
+                public void onTimedText(CharSequence text) {
+                    if (paintDelegate == null)
+                        return;
+                    if (text == null || text.length() == 0) {
+                        paintDelegate.setCue(new CueGroup(Collections.emptyList(), 0));
+                        return;
+                    }
+                    Cue cue = new Cue.Builder()
+                            .setText(text)
+                            .setTextAlignment(Layout.Alignment.ALIGN_CENTER)
+                            .setLine(-1f, Cue.LINE_TYPE_NUMBER)
+                            .setLineAnchor(Cue.ANCHOR_TYPE_END)
+                            .build();
+                    paintDelegate.setCue(new CueGroup(Collections.singletonList(cue), 0));
+                }
+
+                @Override
+                public Handler handler() {
+                    return handler;
+                }
+
+                @Override
+                public ExecutorService executor() {
+                    return _env.getExecutor();
+                }
+            });
+        }
+        updateGeometry();
+        setVisibility(playerVisible);
+        systemPlayer.acquire(source, !paused);
+        startPolling();
+    }
+
+    private void startPolling() {
+        if (pollingTask != null)
+            return;
         pollingTask = new SafeRunnable() {
             @Override
             protected void doRun() {
@@ -652,9 +823,12 @@ public final class VideoPlayer extends BaseObject implements IResource {
             player.setVideoSurfaceView(null);
             player.release();
             player = null;
-            videoWidth = 0;
-            videoHeight = 0;
         }
+        if (systemPlayer != null) {
+            systemPlayer.release();
+        }
+        videoWidth = 0;
+        videoHeight = 0;
     }
 
     public void setupDrm(String type, V8Object options, V8Function callback, V8Function error) {
@@ -668,7 +842,11 @@ public final class VideoPlayer extends BaseObject implements IResource {
             public void doRun() {
                 paused = true;
                 VideoPlayer.this.emit("pause", true);
-                if (player != null)
+                if (systemPlayer != null && systemPlayer.isActive()) {
+                    systemPlayer.stop();
+                    stopped = true;
+                    return;
+                }
                 if (player != null) {
                     player.stop();
                     stopped = true;
@@ -681,6 +859,24 @@ public final class VideoPlayer extends BaseObject implements IResource {
     public void setSource(String url) {
         Log.i(TAG, "Player.setSource " + url);
         source = url;
+        if (useSystemPlayer) {
+            handler.post(new SafeRunnable() {
+                @Override
+                public void doRun() {
+                    if (systemPlayer == null || !systemPlayer.isActive())
+                        return;
+                    if (source == null || source.isEmpty()) {
+                        systemPlayer.stop();
+                        return;
+                    }
+                    stopped = false;
+                    videoWidth = 0;
+                    videoHeight = 0;
+                    systemPlayer.setSource(source);
+                }
+            });
+            return;
+        }
         if (player == null)
             return;
 
@@ -716,6 +912,8 @@ public final class VideoPlayer extends BaseObject implements IResource {
         handler.post(new SafeRunnable() {
             @Override
             public void doRun() {
+                if (player == null)
+                    return;
                 player.setMediaSource(source, true);
                 player.prepare();
                 Log.i(TAG, "Player.setSource exited");
@@ -739,7 +937,9 @@ public final class VideoPlayer extends BaseObject implements IResource {
                 if (paused) {
                     paused = false;
                     VideoPlayer.this.emit("pause", false);
-                    if (player != null)
+                    if (systemPlayer != null && systemPlayer.isActive())
+                        systemPlayer.play();
+                    else if (player != null)
                         player.setPlayWhenReady(true);
                 } else if (stopped) {
                     stopped = false;
@@ -760,7 +960,9 @@ public final class VideoPlayer extends BaseObject implements IResource {
                 {
                     paused = true;
                     VideoPlayer.this.emit("pause", true);
-                    if (player != null)
+                    if (systemPlayer != null && systemPlayer.isActive())
+                        systemPlayer.pause();
+                    else if (player != null)
                         player.setPlayWhenReady(false);
                 }
                 else
@@ -774,12 +976,18 @@ public final class VideoPlayer extends BaseObject implements IResource {
         handler.post(new SafeRunnable() {
             @Override
             public void doRun() {
-                //FIXME: save position if resources reacquired
-                long newPos = player.getCurrentPosition() + pos * 1000L;
+                long newPos;
+                if (systemPlayer != null && systemPlayer.isActive()) {
+                    newPos = systemPlayer.getCurrentPosition() + pos * 1000L;
+                    VideoPlayer.this.emit("timeupdate", newPos / 1000.0);
+                    systemPlayer.seekTo(newPos);
+                    return;
+                }
+                if (player == null)
+                    return;
+                newPos = player.getCurrentPosition() + pos * 1000L;
                 VideoPlayer.this.emit("timeupdate", newPos / 1000.0);
-
-                if (player != null)
-                    player.seekTo(newPos);
+                player.seekTo(newPos);
             }
         });
     }
@@ -789,11 +997,12 @@ public final class VideoPlayer extends BaseObject implements IResource {
         handler.post(new SafeRunnable() {
             @Override
             public void doRun() {
-                //FIXME: save position if resources reacquired
                 VideoPlayer.this.emit("timeupdate", pos);
-
-                if (player != null)
-                    player.seekTo(pos * 1000L);
+                long positionMs = pos * 1000L;
+                if (systemPlayer != null && systemPlayer.isActive())
+                    systemPlayer.seekTo(positionMs);
+                else if (player != null)
+                    player.seekTo(positionMs);
             }
         });
     }
@@ -807,7 +1016,12 @@ public final class VideoPlayer extends BaseObject implements IResource {
                 switch (name) {
                     case "autoplay":
                         autoplay = TypeConverter.toBoolean(value);
-                        if (player != null)
+                        if (systemPlayer != null && systemPlayer.isActive()) {
+                            if (autoplay)
+                                systemPlayer.play();
+                            else
+                                systemPlayer.pause();
+                        } else if (player != null)
                             player.setPlayWhenReady(autoplay);
                         break;
                     case "detectAccessUnits":
@@ -871,6 +1085,10 @@ public final class VideoPlayer extends BaseObject implements IResource {
         Log.v(TAG, "getSubtitles()");
         V8 v8 = _env.getRuntime();
         V8Array subs = new V8Array(v8);
+        if (useSystemPlayer) {
+            // SystemMediaPlayerBackend currently does not expose parsed subtitle tracks
+            return subs;
+        }
         if (tracks == null) {
             Log.w(TAG, "no tracks registered, wait for onTracksChanged event");
             return subs;
@@ -908,6 +1126,12 @@ public final class VideoPlayer extends BaseObject implements IResource {
         handler.post(new SafeRunnable() {
             @Override
             public void doRun() {
+                if (systemPlayer != null && systemPlayer.isActive()) {
+                    systemPlayer.setSubtitleTrack(null);
+                    return;
+                }
+                if (player == null)
+                    return;
                 player.setTrackSelectionParameters(
                         player.getTrackSelectionParameters()
                                 .buildUpon()
@@ -919,6 +1143,18 @@ public final class VideoPlayer extends BaseObject implements IResource {
 
     public void setSubtitles(String trackId) {
         Log.d(TAG, "setSubtitles " + trackId);
+        if (useSystemPlayer) {
+            handler.post(new SafeRunnable() {
+                @Override
+                public void doRun() {
+                    if (systemPlayer != null)
+                        systemPlayer.setSubtitleTrack(trackId);
+                }
+            });
+            return;
+        }
+        if (player == null)
+            return;
         if (trackId == null) {
             hideSubtitles();
             return;
@@ -1016,5 +1252,584 @@ public final class VideoPlayer extends BaseObject implements IResource {
         super.discard();
         viewHolder.discard(_env.getRootView());
         releaseResource();
+        synchronized (INSTANCES_LOCK) {
+            Iterator<WeakReference<VideoPlayer>> it = INSTANCES.iterator();
+            while (it.hasNext()) {
+                VideoPlayer instance = it.next().get();
+                if (instance == null || instance == this)
+                    it.remove();
+            }
+        }
+    }
+
+    private static final class SystemMediaPlayerBackend {
+        interface Callbacks {
+            void emit(String name, Object... args);
+            void onVideoSize(int width, int height);
+            void onTimedText(CharSequence text);
+            Handler handler();
+            ExecutorService executor();
+        }
+
+        static final class SubtitleTrack {
+            String id;
+            String language;
+            String label;
+            String uri;
+            int nativeIndex = -1;
+            boolean active;
+        }
+
+        private static final class VttCue {
+            long startMs;
+            long endMs;
+            String text;
+        }
+
+        private static final String TAG = "SystemMediaPlayer";
+        private static final Pattern ATTR = Pattern.compile("([A-Z0-9-]+)=(\"[^\"]*\"|[^,]*)");
+        private static final int MAX_SUBTITLE_SEGMENTS = 20;
+        private static final long SUBTITLE_REFRESH_MS = 3000;
+
+        private final Context context;
+        private final SurfaceView surfaceView;
+        private final Callbacks callbacks;
+        private MediaPlayer mediaPlayer;
+        private String source;
+        private boolean playWhenReady;
+        private long pendingSeekMs = -1;
+        private boolean surfaceCallbackRegistered;
+        private volatile boolean surfaceValid;
+        private boolean prepared;
+        private boolean initialized;
+        private boolean hasRenderedFrame;
+        private int prepareGeneration;
+        private final List<SubtitleTrack> subtitleTracks = new ArrayList<>();
+        private long watchdogLastPosition = -1;
+        private long watchdogLastTimeMs = -1;
+
+        private final SurfaceHolder.Callback surfaceCallback = new SurfaceHolder.Callback() {
+            @Override
+            public void surfaceCreated(@NonNull SurfaceHolder holder) {
+                surfaceValid = holder.getSurface() != null && holder.getSurface().isValid();
+                callbacks.handler().post(new SafeRunnable() {
+                    @Override
+                    protected void doRun() {
+                        if (mediaPlayer == null)
+                            return;
+                        if (prepared) {
+                            attachDisplay(holder);
+                            return;
+                        }
+                        attachSurfaceAndPrepare();
+                    }
+                });
+            }
+
+            @Override
+            public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {
+            }
+
+            @Override
+            public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
+                surfaceValid = false;
+                MediaPlayer player = mediaPlayer;
+                if (player != null) {
+                    try {
+                        player.setDisplay(null);
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+        };
+
+        SystemMediaPlayerBackend(Context context, SurfaceView surfaceView, Callbacks callbacks) {
+            this.context = context;
+            this.surfaceView = surfaceView;
+            this.callbacks = callbacks;
+        }
+
+        void acquire(String source, boolean playWhenReady) {
+            if (mediaPlayer != null)
+                return;
+            this.source = source;
+            this.playWhenReady = playWhenReady;
+            mediaPlayer = new MediaPlayer();
+            prepared = false;
+            initialized = false;
+            hasRenderedFrame = false;
+            Surface surface = surfaceView.getHolder().getSurface();
+            surfaceValid = surface != null && surface.isValid();
+            registerSurfaceCallback();
+            if (source != null && !source.isEmpty())
+                setSource(source);
+        }
+
+        void release() {
+            unregisterSurfaceCallback();
+            prepared = false;
+            initialized = false;
+            ++prepareGeneration;
+            pendingSeekMs = -1;
+            hasRenderedFrame = false;
+            synchronized (subtitleTracks) {
+                subtitleTracks.clear();
+            }
+            if (mediaPlayer != null) {
+                try {
+                    mediaPlayer.setDisplay(null);
+                    mediaPlayer.reset();
+                    mediaPlayer.release();
+                } catch (Exception e) {
+                    Log.w(TAG, "release", e);
+                }
+                mediaPlayer = null;
+            }
+        }
+
+        boolean isActive() {
+            return mediaPlayer != null;
+        }
+
+        boolean isPrepared() {
+            return prepared;
+        }
+
+        List<SubtitleTrack> copySubtitleTracks() {
+            synchronized (subtitleTracks) {
+                return new ArrayList<>(subtitleTracks);
+            }
+        }
+
+        void setSource(String url) {
+            source = url;
+            prepared = false;
+            hasRenderedFrame = false;
+            pendingSeekMs = -1;
+            if (mediaPlayer == null)
+                return;
+            if (url == null || url.isEmpty() || isPlaceholderUrl(url)) {
+                synchronized (subtitleTracks) {
+                    subtitleTracks.clear();
+                }
+                try {
+                    if (initialized)
+                        mediaPlayer.reset();
+                } catch (IllegalStateException ignored) {
+                }
+                initialized = false;
+                callbacks.emit("stateChanged", Player.STATE_IDLE);
+                return;
+            }
+            attachSurfaceAndPrepare();
+        }
+
+        void play() {
+            playWhenReady = true;
+            startIfReady();
+        }
+
+        void pause() {
+            playWhenReady = false;
+            if (mediaPlayer == null || !prepared)
+                return;
+            try {
+                if (mediaPlayer.isPlaying())
+                    mediaPlayer.pause();
+            } catch (IllegalStateException e) {
+                Log.w(TAG, "pause", e);
+            }
+        }
+
+        void stop() {
+            playWhenReady = false;
+            hasRenderedFrame = false;
+            if (mediaPlayer == null || !prepared) {
+                prepared = false;
+                return;
+            }
+            prepared = false;
+            try {
+                mediaPlayer.stop();
+            } catch (IllegalStateException e) {
+                try {
+                    mediaPlayer.reset();
+                    initialized = false;
+                } catch (IllegalStateException ignored) {
+                }
+            }
+            callbacks.emit("stateChanged", Player.STATE_IDLE);
+        }
+
+        void seekTo(long positionMs) {
+            if (mediaPlayer == null)
+                return;
+            if (!prepared || !hasRenderedFrame) {
+                pendingSeekMs = positionMs;
+                return;
+            }
+            try {
+                mediaPlayer.seekTo((int) Math.max(0, positionMs));
+            } catch (IllegalStateException e) {
+                Log.w(TAG, "seekTo", e);
+                pendingSeekMs = positionMs;
+            }
+        }
+
+        long getCurrentPosition() {
+            if (mediaPlayer == null || !prepared)
+                return 0;
+            try {
+                return mediaPlayer.getCurrentPosition();
+            } catch (IllegalStateException e) {
+                return 0;
+            }
+        }
+
+        void checkWatchdog(long currentPositionMs) {
+            if (!playWhenReady || !hasRenderedFrame || mediaPlayer == null) {
+                watchdogLastPosition = -1;
+                return;
+            }
+            if (!isPlaying()) {
+                // Not playing could mean buffering. If it's buffering for 15s, we can also restart.
+                // But let's only strictly trigger if we are supposed to be playing.
+                long now = android.os.SystemClock.elapsedRealtime();
+                if (watchdogLastPosition == -2) {
+                    if (watchdogLastTimeMs > 0 && now - watchdogLastTimeMs > 15000) {
+                        Log.w(TAG, "MediaPlayer stuck in buffering/stopped state for 15s. Emitting error.");
+                        callbacks.emit("error", "MediaPlayer hung (15s timeout)");
+                        watchdogLastTimeMs = now;
+                    }
+                } else {
+                    watchdogLastPosition = -2;
+                    watchdogLastTimeMs = now;
+                }
+                return;
+            }
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (currentPositionMs == watchdogLastPosition) {
+                if (watchdogLastTimeMs > 0 && now - watchdogLastTimeMs > 10000) {
+                    Log.w(TAG, "MediaPlayer hung (position didn't advance for 10s). Emitting error to restart.");
+                    callbacks.emit("error", "MediaPlayer hung (10s timeout)");
+                    watchdogLastTimeMs = now;
+                }
+            } else {
+                watchdogLastPosition = currentPositionMs;
+                watchdogLastTimeMs = now;
+            }
+        }
+
+        long getDuration() {
+            if (mediaPlayer == null || !prepared)
+                return -1;
+            try {
+                return mediaPlayer.getDuration();
+            } catch (IllegalStateException e) {
+                return -1;
+            }
+        }
+
+        boolean isPlaying() {
+            if (mediaPlayer == null || !prepared)
+                return false;
+            try {
+                return mediaPlayer.isPlaying();
+            } catch (IllegalStateException e) {
+                return false;
+            }
+        }
+
+        private void applyAudio() {
+            mediaPlayer.setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                    .build());
+        }
+
+        private void bindListeners(int generation) {
+            mediaPlayer.setOnPreparedListener(mp -> postOnPlayerThread(generation, () -> {
+                prepared = true;
+                collectNativeSubtitleTracks();
+                callbacks.emit("stateChanged", Player.STATE_READY);
+                startIfReady();
+                callbacks.handler().postDelayed(new SafeRunnable() {
+                    @Override
+                    protected void doRun() {
+                        if (generation != prepareGeneration || mediaPlayer == null)
+                            return;
+                        hasRenderedFrame = true;
+                        applyPendingSeek();
+                    }
+                }, 1200);
+            }));
+            mediaPlayer.setOnCompletionListener(mp -> postOnPlayerThread(generation, () -> {
+                callbacks.emit("stateChanged", Player.STATE_ENDED);
+                callbacks.emit("pause", true);
+            }));
+            mediaPlayer.setOnErrorListener((mp, what, extra) -> {
+                postOnPlayerThread(generation, () -> {
+                    prepared = false;
+                    if (what == -38 || isPlaceholderUrl(source))
+                        return;
+                    String message = "MediaPlayer error what=" + what + " extra=" + extra;
+                    Log.e(TAG, message);
+                    callbacks.emit("error", message);
+                });
+                return true;
+            });
+            mediaPlayer.setOnInfoListener((mp, what, extra) -> {
+                postOnPlayerThread(generation, () -> {
+                    if (what == MediaPlayer.MEDIA_INFO_BUFFERING_START) {
+                        callbacks.emit("stateChanged", Player.STATE_BUFFERING);
+                    } else if (what == MediaPlayer.MEDIA_INFO_BUFFERING_END
+                            || what == MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) {
+                        if (what == MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START)
+                            hasRenderedFrame = true;
+                        applyPendingSeek();
+                        callbacks.emit("stateChanged", Player.STATE_READY);
+                    }
+                });
+                return false;
+            });
+            mediaPlayer.setOnVideoSizeChangedListener((mp, width, height) ->
+                    postOnPlayerThread(generation, () -> callbacks.onVideoSize(width, height)));
+            mediaPlayer.setOnSeekCompleteListener(mp ->
+                    postOnPlayerThread(generation, () -> callbacks.emit("seeked")));
+            mediaPlayer.setOnTimedTextListener((mp, timedText) -> postOnPlayerThread(generation, () -> {
+                CharSequence text = timedText != null ? timedText.getText() : "";
+                callbacks.onTimedText(text != null ? text : "");
+            }));
+        }
+
+        private void postOnPlayerThread(int generation, Runnable action) {
+            callbacks.handler().post(new SafeRunnable() {
+                @Override
+                protected void doRun() {
+                    if (generation != prepareGeneration || mediaPlayer == null)
+                        return;
+                    action.run();
+                }
+            });
+        }
+
+        private void registerSurfaceCallback() {
+            if (surfaceCallbackRegistered)
+                return;
+            surfaceView.getHolder().addCallback(surfaceCallback);
+            surfaceCallbackRegistered = true;
+        }
+
+        private void unregisterSurfaceCallback() {
+            if (!surfaceCallbackRegistered)
+                return;
+            surfaceView.getHolder().removeCallback(surfaceCallback);
+            surfaceCallbackRegistered = false;
+        }
+
+        private void attachSurfaceAndPrepare() {
+            if (mediaPlayer == null || source == null || source.isEmpty() || isPlaceholderUrl(source))
+                return;
+            SurfaceHolder holder = surfaceView.getHolder();
+            Surface surface = holder.getSurface();
+            surfaceValid = surface != null && surface.isValid();
+            if (!surfaceValid) {
+                callbacks.emit("stateChanged", Player.STATE_BUFFERING);
+                return;
+            }
+            try {
+                if (initialized) {
+                    mediaPlayer.reset();
+                }
+                initialized = true;
+                prepared = false;
+                hasRenderedFrame = false;
+                int generation = ++prepareGeneration;
+                bindListeners(generation);
+                applyAudio();
+                mediaPlayer.setScreenOnWhilePlaying(true);
+                if (!attachDisplay(holder))
+                    return;
+                mediaPlayer.setDataSource(context, Uri.parse(source));
+                callbacks.emit("stateChanged", Player.STATE_BUFFERING);
+                mediaPlayer.prepareAsync();
+            } catch (IOException | IllegalStateException | IllegalArgumentException | SecurityException e) {
+                Log.e(TAG, "prepare failed", e);
+                if (e instanceof IllegalArgumentException) {
+                    Log.w(TAG, "skipping error emit for invalid surface/source");
+                    return;
+                }
+                if (!isPlaceholderUrl(source))
+                    callbacks.emit("error", e.toString());
+            }
+        }
+
+        private boolean attachDisplay(SurfaceHolder holder) {
+            if (mediaPlayer == null)
+                return false;
+            Surface surface = holder.getSurface();
+            if (surface == null || !surface.isValid() || !surfaceValid)
+                return false;
+            try {
+                mediaPlayer.setDisplay(holder);
+                return true;
+            } catch (IllegalArgumentException | IllegalStateException e) {
+                Log.w(TAG, "setDisplay skipped", e);
+                return false;
+            }
+        }
+
+        private void applyPendingSeek() {
+            if (mediaPlayer == null || !prepared || pendingSeekMs < 0)
+                return;
+            try {
+                mediaPlayer.seekTo((int) pendingSeekMs);
+            } catch (IllegalStateException e) {
+                Log.w(TAG, "pending seek", e);
+                return;
+            }
+            pendingSeekMs = -1;
+        }
+
+        private void startIfReady() {
+            if (mediaPlayer == null || !prepared || !playWhenReady)
+                return;
+            try {
+                mediaPlayer.start();
+                callbacks.emit("pause", false);
+            } catch (IllegalStateException e) {
+                Log.w(TAG, "start", e);
+            }
+        }
+
+        void setSubtitleTrack(String trackId) {
+            if (trackId == null || "off".equals(trackId) || mediaPlayer == null) {
+                deselectNativeTextTracks();
+                return;
+            }
+
+            SubtitleTrack selected = null;
+            synchronized (subtitleTracks) {
+                for (SubtitleTrack track : subtitleTracks) {
+                    if (trackId.equals(track.id)) {
+                        track.active = true;
+                        selected = track;
+                        break;
+                    }
+                }
+            }
+            if (selected == null)
+                return;
+            if (selected.nativeIndex >= 0) {
+                try {
+                    mediaPlayer.selectTrack(selected.nativeIndex);
+                } catch (Exception e) {
+                    Log.w(TAG, "selectTrack", e);
+                }
+            }
+        }
+
+        void updateSubtitleCues(long positionMs) {
+            // Stub: system player does not support client-side subtitles due to HLS server packaging
+        }
+
+        private void deselectNativeTextTracks() {
+            if (mediaPlayer == null || !prepared)
+                return;
+            try {
+                MediaPlayer.TrackInfo[] infos = mediaPlayer.getTrackInfo();
+                for (int i = 0; i < infos.length; i++) {
+                    int type = infos[i].getTrackType();
+                    if (type != MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_TIMEDTEXT
+                            && type != MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_SUBTITLE)
+                        continue;
+                    try {
+                        mediaPlayer.deselectTrack(i);
+                    } catch (Exception ignored) {
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "deselectTrack", e);
+            }
+        }
+
+        private void collectNativeSubtitleTracks() {
+            if (mediaPlayer == null)
+                return;
+            try {
+                MediaPlayer.TrackInfo[] infos = mediaPlayer.getTrackInfo();
+                synchronized (subtitleTracks) {
+                    for (int i = 0; i < infos.length; i++) {
+                        int type = infos[i].getTrackType();
+                        if (type != MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_TIMEDTEXT
+                                && type != MediaPlayer.TrackInfo.MEDIA_TRACK_TYPE_SUBTITLE)
+                            continue;
+                        SubtitleTrack track = new SubtitleTrack();
+                        track.id = "native." + i;
+                        track.nativeIndex = i;
+                        track.language = normalizeLanguage(infos[i].getLanguage());
+                        track.label = track.language;
+                        subtitleTracks.add(track);
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "getTrackInfo", e);
+            }
+        }
+
+        private static String normalizeLanguage(String language) {
+            if (language == null)
+                return "";
+            String lang = language.trim().toLowerCase(Locale.US);
+            if (lang.startsWith("ru"))
+                return "ru";
+            if (lang.startsWith("en"))
+                return "en";
+            if ("und".equals(lang) || "unknown".equals(lang))
+                return "";
+            int dash = lang.indexOf('-');
+            return dash > 0 ? lang.substring(0, dash) : lang;
+        }
+
+        private static String resolveUrl(String base, String ref) {
+            try {
+                URL resolved = new URL(new URL(base), ref);
+                String result = resolved.toString();
+                int query = base.indexOf('?');
+                if (query >= 0 && !ref.contains("?") && !result.contains("?"))
+                    result += base.substring(query);
+                return result;
+            } catch (Exception e) {
+                return ref;
+            }
+        }
+
+        private static String fetchText(String url) throws IOException {
+            HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+            connection.setConnectTimeout(8000);
+            connection.setReadTimeout(8000);
+            connection.setInstanceFollowRedirects(true);
+            connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) AppleWebKit/537.36");
+            try (InputStream input = connection.getInputStream();
+                 ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+                byte[] buffer = new byte[4096];
+                int read;
+                while ((read = input.read(buffer)) != -1)
+                    output.write(buffer, 0, read);
+                return output.toString(StandardCharsets.UTF_8.name());
+            } finally {
+                connection.disconnect();
+            }
+        }
+
+        private static boolean isPlaceholderUrl(String url) {
+            if (url == null || url.isEmpty())
+                return true;
+            String value = url.toLowerCase();
+            return value.contains("black.mp4")
+                    || value.startsWith("android.resource://")
+                    || value.startsWith("asset://")
+                    || value.startsWith("res/");
+        }
     }
 }
